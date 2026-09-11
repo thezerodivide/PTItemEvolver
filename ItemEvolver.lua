@@ -2,7 +2,7 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local SCRIPT_NAME = 'PTItemEvolver'
-local VERSION = 'v1.0'
+local VERSION = 'v1.1'
 local WINDOW_TITLE = string.format('%s %s - Automatic Item Evolver', SCRIPT_NAME, VERSION)
 
 local running = true
@@ -12,6 +12,16 @@ local filter_text = ''
 local show_all_items = false
 local compact_mode = false
 local window_resize_pending = nil
+local window_pos_pending = nil
+local persisted_window_x = nil
+local persisted_window_y = nil
+local persisted_window_width = nil
+local persisted_window_height = nil
+local last_saved_window_x = nil
+local last_saved_window_y = nil
+local last_saved_window_width = nil
+local last_saved_window_height = nil
+local last_window_geometry_save_ms = 0
 local auto_scroll_log = true
 local items = {}
 local scan_summary = {total = 0, eligible = 0, complete = 0, unknown = 0, powersource = 0, unusable = 0, errors = 0, cursor_present = false}
@@ -39,10 +49,14 @@ local queue_message = 'Queue is empty.'
 local active_queue_entry_id = nil
 local queue_advance_pending = false
 local queue_start_tac_when_started = false
+local queue_keep_tac_running_after_complete = false
 local queue_tac_started_by_ptie = false
+local persistence_recovery_pending = false
 
--- Forward declaration: the queue engine calls this before its implementation appears below.
+-- Forward declarations.
 local stage_selected_item
+local validate_queue_order
+local save_persistent_state
 
 
 local function safe_call(fn, default)
@@ -318,24 +332,11 @@ local function refresh_inventory()
     items = {}
     selected_index = nil
     scan_summary = {total = 0, eligible = 0, complete = 0, unknown = 0, powersource = 0, unusable = 0, errors = 0, cursor_present = false}
-    log('v1.0 worn-source support: equipped UPGRADABLE items in worn slots 0-20 may be staged/queued; if powersource is occupied, its original item is parked in a separately verified safe inventory slot rather than the worn source slot.', true)
-log('v1.0 queue completion fix: a row is completed only when that row\'s active transaction explicitly verified its requested final tier. Manual restore before target returns the row to QUEUED and pauses the queue, so an already-existing equivalent Legendary cannot false-complete an Enchanted->Legendary row.', true)
-log('v1.0 queue TAC startup option: when enabled, TAC remains paused while the queue is built and the first item is staged. PTItemEvolver issues /ac run only after that item is verified in power-source and monitoring is active; PTItemEvolver then owns that startup and pauses TAC when the queue pauses, errors, or completes.', true)
-log('v1.0 queue UI model: eligible item rows have Add buttons; target tier is selected in each queue row with a dropdown; rows support Up/Down/Remove; completed rows are removed from the active queue immediately; PAUSED state exposes Resume Queue instead of Start Queue.', true)
-log('v1.0 main UI cleanup: queue and item selection remain primary; selected-item details, manual controls, scanner statistics, debug controls, slash-command help, and recent diagnostic log are collapsed by default. Show-all scanning lives under Advanced Manual Controls and is off by default; filtered item rows omit the redundant [UPGRADABLE] tag; the main catalog uses Worn Items / Bag Items / All Items tabs with the queue persistently visible to the right; queue target selectors are compact with row controls inline, and queue restore is attached to the active queue row. No queue/evolution engine behavior changed.', true)
-log('v1.0 queue UI refinement: while an item is ACTIVE, only that row is locked. Future QUEUED rows may change target, reorder among future rows, or be removed. The active row is a fixed boundary and Clear Queue remains unavailable during a transaction.', true)
-log('v1.0 item list polish: Enchanted item names render green; Base item names remain normal white. No queue/evolution behavior changed.', true)
-log('v1.0 compact mode: operational queue view with current item/target/state, Restore and Pause controls, TAC-start option when idle, Start/Resume/Clear controls, and a three-row queue preview. Full Mode retains all editing/catalog/diagnostic controls.', true)
-log('v1.0 compact resize fix: switching to Compact Mode requests 460x310; returning to Full Mode requests 1000x650. Resize is applied for one frame only so manual resizing remains available afterward.', true)
-log('v1.0 first public release: validated queue workflow, worn/bag/all item tabs, live editing of future queue rows, safe restore, TAC coordination, and compact mode.', true)
-log('============================================================', true)
     log(string.format('%s %s starting read-only inventory scan', SCRIPT_NAME, VERSION), true)
     log(string.format('Character=%s Server=%s MQVersion=%s',
         get_character_name(),
         get_server_name(),
         val_to_string(safe_call(function() return mq.TLO.MacroQuest.Version() end, '<unknown>'))), true)
-    log('v1.0 normal inventory scan is lightweight; extended item diagnostics are loaded only on demand for the selected item.', true)
-    log('Project Triune note: standard MQ Evolving.* fields remain Triune-unreliable and are excluded from normal scanning.', true)
 
     -- Project Triune / this MQ build uses standard character inventory indices 0..32:
     -- worn equipment 0..22 and top-level inventory 23..32. Containers are traversed recursively.
@@ -659,6 +660,7 @@ local function notify_location(loc)
 end
 
 local query_tac_state
+local stop_queue_owned_tac
 
 local function set_move_error(msg)
     move_state = 'ERROR'
@@ -705,7 +707,7 @@ query_tac_state = function()
     return nil
 end
 
-local function stop_queue_owned_tac(reason)
+stop_queue_owned_tac = function(reason)
     if not queue_tac_started_by_ptie then return true end
 
     local state = query_tac_state()
@@ -729,6 +731,70 @@ local function stop_queue_owned_tac(reason)
 
     queue_tac_started_by_ptie = false
     log(string.format('QUEUE TAC OWNERSHIP RELEASED: reason=%s.', tostring(reason or '<none>')), true)
+    return true
+end
+
+
+local function release_queue_owned_tac_running(reason)
+    if not queue_tac_started_by_ptie then return true end
+
+    local state = query_tac_state()
+    if state ~= 'running' then
+        log(string.format(
+            'QUEUE TAC KEEP-RUNNING FAILED: reason=%s status=%s; ownership retained for safety.',
+            tostring(reason or '<none>'), tostring(state)
+        ), true)
+        return false
+    end
+
+    queue_tac_started_by_ptie = false
+    log(string.format(
+        'QUEUE TAC OWNERSHIP RELEASED RUNNING: reason=%s status=running; TAC intentionally left running.',
+        tostring(reason or '<none>')
+    ), true)
+    return true
+end
+
+local function ensure_queue_owned_tac_running(reason)
+    if not queue_tac_started_by_ptie then return true end
+
+    local state = query_tac_state()
+    if state == 'running' then
+        log(string.format(
+            'QUEUE TAC CONTINUE VERIFIED: reason=%s status=running ownership_retained=true.',
+            tostring(reason or '<none>')
+        ), true)
+        return true
+    end
+
+    if state ~= 'paused' then
+        log(string.format(
+            'QUEUE TAC CONTINUE FAILED: reason=%s status=%s; ownership retained and queue will stop for safety.',
+            tostring(reason or '<none>'), tostring(state)
+        ), true)
+        return false
+    end
+
+    log(string.format(
+        'QUEUE TAC CONTINUE: reason=%s; PTItemEvolver owns TAC startup and TAC is paused after item handoff; issuing explicit /ac run.',
+        tostring(reason or '<none>')
+    ), true)
+    mq.cmd('/ac run')
+    mq.delay(100)
+
+    state = query_tac_state()
+    if state ~= 'running' then
+        log(string.format(
+            'QUEUE TAC CONTINUE FAILED: reason=%s post_run_status=%s; ownership retained and queue will stop for safety.',
+            tostring(reason or '<none>'), tostring(state)
+        ), true)
+        return false
+    end
+
+    log(string.format(
+        'QUEUE TAC CONTINUE VERIFIED: reason=%s status=running ownership_retained=true.',
+        tostring(reason or '<none>')
+    ), true)
     return true
 end
 
@@ -893,6 +959,275 @@ local function clone_location(loc)
     }
 end
 
+
+-- -----------------------------------------------------------------------------
+-- v1.1 queue/preferences persistence
+-- -----------------------------------------------------------------------------
+local function persistence_safe_component(value)
+    value = tostring(value or 'unknown')
+    value = value:gsub('[^%w%._%-]', '_')
+    if value == '' then value = 'unknown' end
+    return value
+end
+
+local function persistence_path()
+    local base = mq.configDir or '.'
+    return string.format(
+        '%s/%s_%s_%s.ini',
+        base,
+        SCRIPT_NAME,
+        persistence_safe_component(get_server_name()),
+        persistence_safe_component(get_character_name())
+    )
+end
+
+local function persistence_encode(value)
+    if value == nil then return '' end
+    local s = tostring(value)
+    s = s:gsub('%%', '%%25')
+    s = s:gsub('\t', '%%09')
+    s = s:gsub('\r', '%%0D')
+    s = s:gsub('\n', '%%0A')
+    return s
+end
+
+local function persistence_decode(value)
+    local s = tostring(value or '')
+    s = s:gsub('%%0A', '\n')
+    s = s:gsub('%%0D', '\r')
+    s = s:gsub('%%09', '\t')
+    s = s:gsub('%%25', '%%')
+    return s
+end
+
+local function persistence_bool(value)
+    return tostring(value) == 'true' or tostring(value) == '1'
+end
+
+local function persistence_split_tab(line)
+    local out = {}
+    for field in (tostring(line or '') .. '\t'):gmatch('(.-)\t') do
+        out[#out + 1] = persistence_decode(field)
+    end
+    return out
+end
+
+save_persistent_state = function(reason)
+    local path = persistence_path()
+    local tmp = path .. '.tmp'
+    local f, err = io.open(tmp, 'w')
+    if not f then
+        log(string.format('PERSIST SAVE ERROR: reason=%s path=%s error=%s',
+            tostring(reason or '<none>'), tostring(path), tostring(err)), true)
+        return false
+    end
+
+    local recovery_pending = staged_transaction ~= nil or active_queue_entry_id ~= nil
+    persistence_recovery_pending = recovery_pending
+
+    f:write('format=1\n')
+    f:write('start_tac=', tostring(queue_start_tac_when_started), '\n')
+    f:write('keep_tac_running=', tostring(queue_keep_tac_running_after_complete), '\n')
+    f:write('compact_mode=', tostring(compact_mode), '\n')
+    f:write('window_x=', tostring(persisted_window_x or ''), '\n')
+    f:write('window_y=', tostring(persisted_window_y or ''), '\n')
+    f:write('window_width=', tostring(persisted_window_width or ''), '\n')
+    f:write('window_height=', tostring(persisted_window_height or ''), '\n')
+    f:write('recovery_pending=', tostring(recovery_pending), '\n')
+    f:write('next_id=', tostring(queue_next_id), '\n')
+
+    for _, entry in ipairs(queue_entries) do
+        local loc = entry.current_location or {}
+        local fields = {
+            entry.id,
+            entry.instance_key,
+            entry.display_name,
+            entry.normalized_base_name,
+            entry.normalized_base_id,
+            entry.starting_tier,
+            entry.target_tier,
+            loc.kind,
+            loc.label,
+            loc.top_slot,
+            loc.bag_slot,
+        }
+        local encoded = {}
+        for i, value in ipairs(fields) do encoded[i] = persistence_encode(value) end
+        f:write('entry=', table.concat(encoded, '\t'), '\n')
+    end
+    f:close()
+
+    pcall(os.remove, path)
+    local renamed, rename_err = os.rename(tmp, path)
+    if not renamed then
+        local rf = io.open(tmp, 'r')
+        local wf, wf_err = io.open(path, 'w')
+        if not rf or not wf then
+            if rf then rf:close() end
+            if wf then wf:close() end
+            log(string.format(
+                'PERSIST SAVE ERROR: reason=%s path=%s rename_error=%s fallback_error=%s',
+                tostring(reason or '<none>'), tostring(path),
+                tostring(rename_err), tostring(wf_err)
+            ), true)
+            return false
+        end
+        wf:write(rf:read('*a') or '')
+        rf:close()
+        wf:close()
+        pcall(os.remove, tmp)
+    end
+    return true
+end
+
+local function load_persistent_state()
+    local path = persistence_path()
+    local f = io.open(path, 'r')
+    if not f then
+        log(string.format('PERSIST LOAD: no saved state for this character (%s).', tostring(path)), true)
+        return false
+    end
+
+    local loaded_entries = {}
+    local loaded_next_id = 1
+    local loaded_start_tac = queue_start_tac_when_started
+    local loaded_keep_tac = queue_keep_tac_running_after_complete
+    local loaded_compact = compact_mode
+    local loaded_window_x = nil
+    local loaded_window_y = nil
+    local loaded_window_width = nil
+    local loaded_window_height = nil
+    local loaded_recovery = false
+    local format_version = nil
+
+    for line in f:lines() do
+        local key, value = line:match('^([^=]+)=(.*)$')
+        if key == 'format' then
+            format_version = tonumber(value)
+        elseif key == 'start_tac' then
+            loaded_start_tac = persistence_bool(value)
+        elseif key == 'keep_tac_running' then
+            loaded_keep_tac = persistence_bool(value)
+        elseif key == 'compact_mode' then
+            loaded_compact = persistence_bool(value)
+        elseif key == 'window_x' then
+            loaded_window_x = tonumber(value)
+        elseif key == 'window_y' then
+            loaded_window_y = tonumber(value)
+        elseif key == 'window_width' then
+            loaded_window_width = tonumber(value)
+        elseif key == 'window_height' then
+            loaded_window_height = tonumber(value)
+        elseif key == 'recovery_pending' then
+            loaded_recovery = persistence_bool(value)
+        elseif key == 'next_id' then
+            loaded_next_id = tonumber(value) or loaded_next_id
+        elseif key == 'entry' then
+            local p = persistence_split_tab(value)
+            if #p >= 10 then
+                local id = tonumber(p[1])
+                local base_id = tonumber(p[5])
+                local top_slot = tonumber(p[10])
+                local bag_slot = tonumber(p[11])
+                if id and base_id and p[4] ~= '' and p[6] ~= '' and p[7] ~= '' then
+                    loaded_entries[#loaded_entries + 1] = {
+                        id = id,
+                        instance_key = p[2],
+                        display_name = p[3],
+                        normalized_base_name = p[4],
+                        normalized_base_id = base_id,
+                        starting_tier = p[6],
+                        target_tier = p[7],
+                        current_location = {
+                            kind = p[8] ~= '' and p[8] or nil,
+                            label = p[9] ~= '' and p[9] or nil,
+                            top_slot = top_slot,
+                            bag_slot = bag_slot,
+                        },
+                        status = 'QUEUED',
+                        message = '',
+                    }
+                    if id >= loaded_next_id then loaded_next_id = id + 1 end
+                end
+            end
+        end
+    end
+    f:close()
+
+    if format_version ~= 1 then
+        log(string.format(
+            'PERSIST LOAD ERROR: unsupported format=%s path=%s; saved state ignored.',
+            tostring(format_version), tostring(path)
+        ), true)
+        return false
+    end
+
+    queue_entries = loaded_entries
+    queue_next_id = loaded_next_id
+    queue_start_tac_when_started = loaded_start_tac
+    queue_keep_tac_running_after_complete = loaded_keep_tac
+    compact_mode = loaded_compact
+    persistence_recovery_pending = loaded_recovery
+
+    persisted_window_x = loaded_window_x
+    persisted_window_y = loaded_window_y
+    persisted_window_width = loaded_window_width
+    persisted_window_height = loaded_window_height
+    last_saved_window_x = loaded_window_x
+    last_saved_window_y = loaded_window_y
+    last_saved_window_width = loaded_window_width
+    last_saved_window_height = loaded_window_height
+
+    if loaded_window_x and loaded_window_y then
+        window_pos_pending = { x = loaded_window_x, y = loaded_window_y }
+    end
+    if loaded_window_width and loaded_window_height then
+        window_resize_pending = { width = loaded_window_width, height = loaded_window_height }
+    end
+
+    queue_running = false
+    queue_pause_after_current = false
+    queue_advance_pending = false
+    active_queue_entry_id = nil
+    queue_tac_started_by_ptie = false
+
+    if #queue_entries > 0 then
+        local ok, err = validate_queue_order()
+        if not ok then
+            queue_state = 'ERROR'
+            queue_message = 'Saved queue failed validation: ' .. tostring(err)
+            log('PERSIST LOAD ERROR: ' .. queue_message, true)
+            return false
+        end
+
+        queue_state = loaded_recovery and 'PAUSED' or 'READY'
+        if loaded_recovery then
+            queue_message = 'Saved queue restored. PTItemEvolver was stopped during an active transaction; live item state must be re-verified before the queue can resume.'
+        else
+            queue_message = string.format(
+                'Restored %d queued entr%s from disk. Press Start Queue when ready.',
+                #queue_entries,
+                #queue_entries == 1 and 'y' or 'ies'
+            )
+        end
+    else
+        queue_state = 'IDLE'
+        queue_message = 'Queue is empty.'
+    end
+
+    log(string.format(
+        'PERSIST LOAD: path=%s entries=%d start_tac=%s keep_tac_running=%s compact=%s window=(%s,%s %sx%s) recovery_pending=%s',
+        tostring(path), #queue_entries,
+        tostring(queue_start_tac_when_started),
+        tostring(queue_keep_tac_running_after_complete),
+        tostring(compact_mode),
+        tostring(persisted_window_x), tostring(persisted_window_y),
+        tostring(persisted_window_width), tostring(persisted_window_height),
+        tostring(persistence_recovery_pending)
+    ), true)
+    return true
+end
+
 local function queue_entry_by_id(id)
     for _, entry in ipairs(queue_entries) do
         if entry.id == id then return entry end
@@ -1018,7 +1353,8 @@ local function find_exact_legendary_inventory_match(tx)
 
     local expected_id = tonumber(tx.expected_legendary_id)
     local expected_base_id = tonumber(tx.normalized_base_id or tx.base_id)
-    local expected_base_name = tx.normalized_base_name or normalize_base_name(tx.original_name or tx.current_name or tx.item_name or '')
+    local fallback_base_name = normalize_tier_name(tx.original_name or tx.current_name or tx.item_name or '')
+    local expected_base_name = tx.normalized_base_name or fallback_base_name
 
     local matches = {}
 
@@ -1252,11 +1588,6 @@ local function queue_source_supported(rec)
 end
 
 local function add_item_to_queue(item_index)
-    if queue_running or active_queue_entry_id or staged_transaction then
-        queue_message = 'Cannot edit the queue while an item transaction is active.'
-        return
-    end
-
     local rec = item_index and items[item_index] or nil
     if not rec then
         queue_message = 'The selected inventory row is no longer available.'
@@ -1311,18 +1642,40 @@ local function add_item_to_queue(item_index)
 
     queue_next_id = queue_next_id + 1
     queue_entries[#queue_entries + 1] = entry
-    queue_state = 'READY'
-    queue_message = string.format('Added %s. Queue target defaults to %s and can be changed in the queue row.', entry.display_name, entry.target_tier)
+
+    local ok, err = validate_queue_order()
+    if not ok then
+        table.remove(queue_entries, #queue_entries)
+        queue_message = 'Cannot add item: ' .. tostring(err)
+        log(string.format(
+            'QUEUE ADD REJECTED: id=%d instance=%s item=%s target=%s running=%s reason=%s',
+            entry.id, entry.instance_key, entry.display_name, tostring(entry.target_tier),
+            tostring(queue_running), tostring(err)
+        ), true)
+        return
+    end
+
+    if not queue_running then
+        queue_state = 'READY'
+    end
+    queue_message = string.format(
+        'Added %s to %s. Queue target defaults to %s and can be changed in the queue row.',
+        entry.display_name,
+        queue_running and 'the future queue' or 'the queue',
+        entry.target_tier
+    )
 
     log(string.format(
-        'QUEUE ADD: id=%d instance=%s item=%s base_id=%s start_tier=%s default_target=%s location=%s',
+        'QUEUE ADD: id=%d instance=%s item=%s base_id=%s start_tier=%s default_target=%s location=%s running=%s active_queue_entry_id=%s',
         entry.id, entry.instance_key, entry.display_name, tostring(entry.normalized_base_id),
-        tostring(entry.starting_tier), entry.target_tier, tostring(entry.current_location.label)
+        tostring(entry.starting_tier), entry.target_tier, tostring(entry.current_location.label),
+        tostring(queue_running), tostring(active_queue_entry_id)
     ), true)
+    save_persistent_state('queue add')
 end
 
 
-local function validate_queue_order()
+validate_queue_order = function()
     local tier_by_instance = {}
     for pos, entry in ipairs(queue_entries) do
         if entry.status == 'ACTIVE' or entry.status == 'QUEUED' then
@@ -1374,6 +1727,7 @@ local function queue_set_target(index, new_target)
         'QUEUE TARGET CHANGED: id=%d item=%s old=%s new=%s',
         entry.id, tostring(entry.display_name), tostring(old_target), tostring(new_target)
     ), true)
+    save_persistent_state('queue target changed')
     return true
 end
 
@@ -1406,6 +1760,7 @@ local function queue_move_entry(index, delta)
         'QUEUE ORDER CHANGED: moved_id=%s new_index=%d running=%s',
         tostring(entry.id), other, tostring(queue_running)
     ), true)
+    save_persistent_state('queue order changed')
 end
 
 local function queue_remove_entry(index)
@@ -1435,6 +1790,7 @@ local function queue_remove_entry(index)
             queue_message = 'Queue entry removed.'
         end
     end
+    save_persistent_state('queue entry removed')
 end
 
 local function queue_clear()
@@ -1447,6 +1803,8 @@ local function queue_clear()
     queue_message = 'Queue is empty.'
     queue_pause_after_current = false
     queue_advance_pending = false
+    persistence_recovery_pending = false
+    save_persistent_state('queue cleared')
 end
 
 local function queue_has_queued_entries()
@@ -1461,6 +1819,37 @@ local function start_queue()
         queue_message = 'Cannot start queue while another item transaction is active.'
         return
     end
+
+    if persistence_recovery_pending then
+        local first_entry = nil
+        for _, candidate in ipairs(queue_entries) do
+            if candidate.status == 'QUEUED' then
+                first_entry = candidate
+                break
+            end
+        end
+
+        if first_entry then
+            local recovered_idx, recovered_err = queue_resolve_inventory_index(first_entry)
+            if not recovered_idx then
+                queue_state = 'PAUSED'
+                queue_message = 'Saved queue recovery is pending. The previously active item is not safely resolvable in normal worn/bag inventory. If it is still in powersource, move/restore it manually, then press Start Queue again. ' .. tostring(recovered_err or '')
+                log('PERSIST RECOVERY BLOCKED: ' .. queue_message, true)
+                return
+            end
+
+            persistence_recovery_pending = false
+            log(string.format(
+                'PERSIST RECOVERY CLEARED: first queued item re-resolved safely at %s; queue may start normally.',
+                tostring(items[recovered_idx] and items[recovered_idx].location or '<unknown>')
+            ), true)
+            save_persistent_state('recovery cleared')
+        else
+            persistence_recovery_pending = false
+            save_persistent_state('recovery cleared with empty queue')
+        end
+    end
+
     if not queue_has_queued_entries() then
         queue_message = 'There are no queued entries to run.'
         return
@@ -1478,7 +1867,12 @@ local function start_queue()
     queue_advance_pending = true
     queue_state = 'RUNNING'
     queue_message = 'Queue started. Waiting for a safe handoff point.'
-    log(string.format('QUEUE START: entries=%d start_tac_when_started=%s', #queue_entries, tostring(queue_start_tac_when_started)), true)
+    log(string.format(
+        'QUEUE START: entries=%d start_tac_when_started=%s keep_tac_running_after_complete=%s',
+        #queue_entries,
+        tostring(queue_start_tac_when_started),
+        tostring(queue_keep_tac_running_after_complete)
+    ), true)
 end
 
 local function pause_queue_after_current()
@@ -1588,6 +1982,8 @@ local function complete_active_queue_entry(tx, final_location, final_tier)
     end
 
     active_queue_entry_id = nil
+    persistence_recovery_pending = false
+    save_persistent_state('queue entry completed')
 
     if queue_pause_after_current then
         queue_running = false
@@ -1601,16 +1997,46 @@ local function complete_active_queue_entry(tx, final_location, final_tier)
     end
 
     if queue_has_queued_entries() then
+        if queue_tac_started_by_ptie then
+            local tac_ok = ensure_queue_owned_tac_running('continuing queue after completed item')
+            if not tac_ok then
+                queue_running = false
+                queue_advance_pending = false
+                queue_state = 'ERROR'
+                queue_message = 'Current item completed safely, but PTItemEvolver could not restart queue-owned TAC for the next item. Queue stopped for safety.'
+                log('QUEUE ERROR: ' .. queue_message, true)
+                return true
+            end
+        end
+
         queue_advance_pending = true
         queue_state = 'RUNNING'
         queue_message = 'Current item complete. Waiting for a safe point to start the next queue entry.'
     else
         queue_running = false
         queue_advance_pending = false
-        stop_queue_owned_tac('queue complete')
+
+        if queue_tac_started_by_ptie and queue_keep_tac_running_after_complete then
+            local keep_ok = release_queue_owned_tac_running('queue complete; keep-running option enabled')
+            if not keep_ok then
+                queue_state = 'ERROR'
+                queue_message = 'All item upgrades completed, but TAC was not verified running at queue completion. Queue ownership was retained for safety.'
+                log('QUEUE ERROR: ' .. queue_message, true)
+                refresh_inventory()
+                return true
+            end
+        else
+            stop_queue_owned_tac('queue complete')
+        end
+
         queue_state = 'COMPLETE'
-        queue_message = 'All queued entries completed.'
-        log('QUEUE COMPLETE: all entries finished.', true)
+        queue_message = queue_keep_tac_running_after_complete
+            and 'All queued entries completed. TAC was left running if PTItemEvolver owned its startup.'
+            or 'All queued entries completed.'
+        log(string.format(
+            'QUEUE COMPLETE: all entries finished. keep_tac_running_after_complete=%s',
+            tostring(queue_keep_tac_running_after_complete)
+        ), true)
         refresh_inventory()
     end
     return true
@@ -1651,8 +2077,28 @@ local function process_queue_engine()
     if not entry then
         queue_running = false
         queue_advance_pending = false
+
+        if queue_tac_started_by_ptie and queue_keep_tac_running_after_complete then
+            local keep_ok = release_queue_owned_tac_running('queue complete with no remaining queued entry; keep-running option enabled')
+            if not keep_ok then
+                queue_state = 'ERROR'
+                queue_message = 'Queue had no remaining entries, but TAC was not verified running. Queue ownership was retained for safety.'
+                log('QUEUE ERROR: ' .. queue_message, true)
+                refresh_inventory()
+                return
+            end
+        else
+            stop_queue_owned_tac('queue complete with no remaining queued entry')
+        end
+
         queue_state = 'COMPLETE'
-        queue_message = 'All queued entries completed.'
+        queue_message = queue_keep_tac_running_after_complete
+            and 'All queued entries completed. TAC was left running if PTItemEvolver owned its startup.'
+            or 'All queued entries completed.'
+        log(string.format(
+            'QUEUE COMPLETE: no remaining queued entries. keep_tac_running_after_complete=%s',
+            tostring(queue_keep_tac_running_after_complete)
+        ), true)
         refresh_inventory()
         return
     end
@@ -1694,6 +2140,7 @@ local function process_queue_engine()
     stage_selected_item(idx, true, entry.target_tier)
     if staged_transaction and active_queue_entry_id == entry.id then
         staged_transaction.queue_entry_id = entry.id
+        save_persistent_state('active queue transaction staged')
 
         if queue_start_tac_when_started and not queue_tac_started_by_ptie then
             local tac_state = query_tac_state()
@@ -1714,7 +2161,13 @@ local function process_queue_engine()
                 queue_tac_started_by_ptie = true
                 staged_transaction.tac_started_by_queue = true
                 log('QUEUE TAC START VERIFIED: TAC is running; PTItemEvolver owns this queue-started TAC session.', true)
-                move_message = move_message .. ' TAC was started by the queue after safe staging.'
+                local staged_name = staged_transaction.selected and staged_transaction.selected.name or entry.display_name
+                move_message = string.format(
+                    '%s is in power-source. Monitoring next transition=%s, final target=%s; TAC is running (started by PTItemEvolver after safe staging).',
+                    tostring(staged_name),
+                    tostring(staged_transaction.target_tier),
+                    tostring(staged_transaction.final_target_tier)
+                )
                 mq.cmdf('/echo [%s] TAC started after queued item was safely staged and monitoring became active.', SCRIPT_NAME)
             elseif tac_state == 'running' then
                 log('QUEUE TAC START SKIPPED: TAC was already running; PTItemEvolver does not claim TAC startup ownership.', true)
@@ -2660,6 +3113,8 @@ restore_staged_item = function()
                 tostring(restore_destination and restore_destination.label or '<unknown>')
             ), true)
             active_queue_entry_id = nil
+            persistence_recovery_pending = false
+            save_persistent_state('active queue item manually restored before target')
             queue_owned = true
         end
     end
@@ -2705,7 +3160,10 @@ local function draw_compact_ui()
     ImGui.SameLine()
     if ImGui.Button('Full Mode') then
         compact_mode = false
+        persisted_window_width = 1000
+        persisted_window_height = 650
         window_resize_pending = { width = 1000, height = 650 }
+        save_persistent_state('full mode selected')
     end
 
     ImGui.Separator()
@@ -2741,7 +3199,13 @@ local function draw_compact_ui()
     local queue_idle_editable = not queue_running and not active_queue_entry_id and not staged_transaction
 
     if queue_idle_editable then
+        local old_start_tac = queue_start_tac_when_started
+        local old_keep_tac = queue_keep_tac_running_after_complete
         queue_start_tac_when_started = ImGui.Checkbox('Start TAC when queue starts', queue_start_tac_when_started)
+        queue_keep_tac_running_after_complete = ImGui.Checkbox('Keep TAC running after queue finishes', queue_keep_tac_running_after_complete)
+        if old_start_tac ~= queue_start_tac_when_started or old_keep_tac ~= queue_keep_tac_running_after_complete then
+            save_persistent_state('queue TAC preference changed')
+        end
 
         if queue_state == 'PAUSED' and queue_has_queued_entries() then
             ImGui.SameLine()
@@ -2788,13 +3252,48 @@ local function draw_compact_ui()
     end
 end
 
+
+local function capture_window_geometry()
+    local now_ms = math.floor((os.clock() or 0) * 1000)
+    if now_ms - last_window_geometry_save_ms < 1000 then return end
+
+    local x, y = ImGui.GetWindowPos()
+    local w, h = ImGui.GetWindowSize()
+    x, y, w, h = tonumber(x), tonumber(y), tonumber(w), tonumber(h)
+    if not x or not y or not w or not h then return end
+
+    persisted_window_x = x
+    persisted_window_y = y
+    persisted_window_width = w
+    persisted_window_height = h
+
+    local changed =
+        last_saved_window_x ~= x
+        or last_saved_window_y ~= y
+        or last_saved_window_width ~= w
+        or last_saved_window_height ~= h
+
+    if changed then
+        last_saved_window_x = x
+        last_saved_window_y = y
+        last_saved_window_width = w
+        last_saved_window_height = h
+        last_window_geometry_save_ms = now_ms
+        save_persistent_state('window geometry changed')
+    end
+end
+
 local function draw_ui()
     if not window_open then return end
 
+    if window_pos_pending then
+        -- Apply restored position for one frame only so the user may move the window afterward.
+        ImGui.SetNextWindowPos(window_pos_pending.x, window_pos_pending.y, 0)
+        window_pos_pending = nil
+    end
+
     if window_resize_pending then
-        -- A condition value of 0 is ImGuiCond_Always. We apply this for one frame
-        -- only so the mode switch resizes immediately without permanently locking
-        -- the user out of manual resizing afterward.
+        -- Apply restored/mode-switch size for one frame only so manual resizing remains available.
         ImGui.SetNextWindowSize(window_resize_pending.width, window_resize_pending.height, 0)
         window_resize_pending = nil
     end
@@ -2809,7 +3308,10 @@ local function draw_ui()
         ImGui.SameLine()
         if ImGui.Button('Compact Mode') then
             compact_mode = true
+            persisted_window_width = 460
+            persisted_window_height = 310
             window_resize_pending = { width = 460, height = 310 }
+            save_persistent_state('compact mode selected')
         end
 
         local active_name = staged_transaction and staged_transaction.selected and staged_transaction.selected.name or '<none>'
@@ -2905,7 +3407,13 @@ local function draw_ui()
             end
 
             if queue_idle_editable then
+                local old_start_tac = queue_start_tac_when_started
+                local old_keep_tac = queue_keep_tac_running_after_complete
                 queue_start_tac_when_started = ImGui.Checkbox('Start TAC when queue starts', queue_start_tac_when_started)
+                queue_keep_tac_running_after_complete = ImGui.Checkbox('Keep TAC running after queue finishes', queue_keep_tac_running_after_complete)
+                if old_start_tac ~= queue_start_tac_when_started or old_keep_tac ~= queue_keep_tac_running_after_complete then
+                    save_persistent_state('queue TAC preference changed')
+                end
 
                 if queue_state == 'PAUSED' and queue_has_queued_entries() then
                     ImGui.SameLine()
@@ -3082,6 +3590,9 @@ local function draw_ui()
         end
         end
     end
+    if should_draw then
+        capture_window_geometry()
+    end
     ImGui.End()
 end
 
@@ -3115,17 +3626,32 @@ mq.event('PTIE_TAC_STATUS', '#*#[Triune] status: #1#, mode: #*#', tac_status_eve
 mq.imgui.init(SCRIPT_NAME, draw_ui)
 
 log(string.format('%s %s loaded', SCRIPT_NAME, VERSION), true)
-log('v0.2.3 automatic single-item engine enabled: user may target Enchanted or Legendary; Consume Experience is not implemented.', true)
-log('v1.0 Base -> Legendary behavior: Base evolves in-place to Enchanted, transaction identity is updated, and monitoring continues automatically to Legendary without an intermediate restore.', true)
-log('v1.0 TAC rule: TAC may run during passive evolution; when the exact expected Legendary appears on cursor PTItemEvolver pauses TAC immediately and verifies paused before item handling.', true)
-log('v1.0 movement safety rule: Legendary placement/restoration may occur in combat ONLY in the verified passive Legendary completion path while TAC is paused; manual movement and Enchanted final-target restore keep the stricter combat guard.', true)
-log(string.format('v0.2.9 debug log rotation enabled: current log max=%d bytes, backups=%d (.1 and .2).', LOG_MAX_BYTES, LOG_BACKUPS), true)
-log('v1.0 polling behavior: normal steady-state loop cadence is 200 ms; bounded transition/item-verification waits retain their existing fast polling.', true)
-log('v1.0 scanner behavior: startup/refresh reads only core classification/identity/container fields and writes one concise log line per item; full property dumps are selected-item/on-demand only.', true)
-log('v1.0 queue enabled: ordered per-entry targets, including the same physical item queued Base->Enchanted and later Enchanted->Legendary; queue advances only at verified safe handoff points.', true)
-log('v1.0 queue resolver: remembered inventory location remains a hint; stale locations are re-resolved by BaseID/name/tier.', true)
-log('v1.0 inherited Legendary cursor recovery: if TAC or another actor auto-inventories the exact expected Legendary before PTItemEvolver can place it, PTItemEvolver searches inventory and accepts exactly one verified Legendary match instead of immediately erroring.', true)
+log('v1.1 includes v1.0.1 fixes: static changelog/build notes are startup-only instead of repeating on refresh; TAC monitoring text now reports queue-started TAC unambiguously; new items may be appended to the future queue while another row is ACTIVE; queue-owned TAC is explicitly restarted and verified after each completed-item handoff before the queue continues; optional keep-TAC-running behavior leaves queue-owned TAC running after successful queue completion.', true)
+log('v1.1 worn-source support: equipped UPGRADABLE items in worn slots 0-20 may be staged/queued; if powersource is occupied, its original item is parked in a separately verified safe inventory slot rather than the worn source slot.', true)
+log('v1.1 queue completion fix: a row is completed only when that row\'s active transaction explicitly verified its requested final tier. Manual restore before target returns the row to QUEUED and pauses the queue, so an already-existing equivalent Legendary cannot false-complete an Enchanted->Legendary row.', true)
+log('v1.1 queue TAC startup option: when enabled, TAC remains paused while the queue is built and the first item is staged. PTItemEvolver issues /ac run only after that item is verified in power-source and monitoring is active; PTItemEvolver then owns that startup and pauses TAC when the queue pauses, errors, or completes.', true)
+log('v1.1 queue UI model: eligible item rows have Add buttons; target tier is selected in each queue row with a dropdown; rows support Up/Down/Remove; completed rows are removed from the active queue immediately; PAUSED state exposes Resume Queue instead of Start Queue.', true)
+log('v1.1 main UI cleanup: queue and item selection remain primary; selected-item details, manual controls, scanner statistics, debug controls, slash-command help, and recent diagnostic log are collapsed by default. Show-all scanning lives under Advanced Manual Controls and is off by default; filtered item rows omit the redundant [UPGRADABLE] tag; the main catalog uses Worn Items / Bag Items / All Items tabs with the queue persistently visible to the right; queue target selectors are compact with row controls inline, and queue restore is attached to the active queue row. No queue/evolution engine behavior changed.', true)
+log('v1.1 queue UI refinement: while an item is ACTIVE, only that row is locked. Future QUEUED rows may change target, reorder among future rows, or be removed. The active row is a fixed boundary and Clear Queue remains unavailable during a transaction.', true)
+log('v1.1 item list polish: Enchanted item names render green; Base item names remain normal white. No queue/evolution behavior changed.', true)
+log('v1.1 compact mode: operational queue view with current item/target/state, Restore and Pause controls, TAC-start option when idle, Start/Resume/Clear controls, and a three-row queue preview. Full Mode retains all editing/catalog/diagnostic controls.', true)
+log('v1.1 compact resize fix: switching to Compact Mode requests 460x310; returning to Full Mode requests 1000x650. Resize is applied for one frame only so manual resizing remains available afterward.', true)
+log('v1.1 inherited v1.0 release baseline: validated queue workflow, worn/bag/all item tabs, live editing of future queue rows, safe restore, TAC coordination, and compact mode.', true)
+log('v1.1 normal inventory scan is lightweight; extended item diagnostics are loaded only on demand for the selected item.', true)
+log('Project Triune note: standard MQ Evolving.* fields remain Triune-unreliable and are excluded from normal scanning.', true)
+log('v1.1 automatic single-item engine enabled: user may target Enchanted or Legendary; Consume Experience is not implemented.', true)
+log('v1.1 Base -> Legendary behavior: Base evolves in-place to Enchanted, transaction identity is updated, and monitoring continues automatically to Legendary without an intermediate restore.', true)
+log('v1.1 TAC rule: TAC may run during passive evolution; when the exact expected Legendary appears on cursor PTItemEvolver pauses TAC immediately and verifies paused before item handling.', true)
+log('v1.1 movement safety rule: Legendary placement/restoration may occur in combat ONLY in the verified passive Legendary completion path while TAC is paused; manual movement and Enchanted final-target restore keep the stricter combat guard.', true)
+log(string.format('v1.1 debug log rotation enabled: current log max=%d bytes, backups=%d (.1 and .2).', LOG_MAX_BYTES, LOG_BACKUPS), true)
+log('v1.1 polling behavior: normal steady-state loop cadence is 200 ms; bounded transition/item-verification waits retain their existing fast polling.', true)
+log('v1.1 scanner behavior: startup/refresh reads only core classification/identity/container fields and writes one concise log line per item; full property dumps are selected-item/on-demand only.', true)
+log('v1.1 queue enabled: ordered per-entry targets, including the same physical item queued Base->Enchanted and later Enchanted->Legendary; queue advances only at verified safe handoff points.', true)
+log('v1.1 queue resolver: remembered inventory location remains a hint; stale locations are re-resolved by BaseID/name/tier.', true)
+log('v1.1 persistence: queue entries, order/targets, TAC queue preferences, Compact/Full mode, and window position/size are saved per character/server and restored on Lua restart. Saved ACTIVE work is never blindly resumed.', true)
+log('v1.0.1 inherited Legendary cursor recovery: if TAC or another actor auto-inventories the exact expected Legendary before PTItemEvolver can place it, PTItemEvolver searches inventory and accepts exactly one verified Legendary match instead of immediately erroring.', true)
 refresh_inventory()
+load_persistent_state()
 
 while running do
     if not window_open then running = false break end
@@ -3137,6 +3663,7 @@ while running do
     mq.delay(200)
 end
 
+save_persistent_state('normal Lua shutdown')
 log(string.format('%s %s stopped', SCRIPT_NAME, VERSION), true)
 mq.unbind('/ptie')
 mq.unevent('PTIE_TAC_STATUS')
