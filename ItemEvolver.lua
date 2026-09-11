@@ -13,10 +13,17 @@ local show_all_items = false
 local compact_mode = false
 local window_resize_pending = nil
 local window_pos_pending = nil
-local persisted_window_x = nil
-local persisted_window_y = nil
-local persisted_window_width = nil
-local persisted_window_height = nil
+
+local full_window_x = nil
+local full_window_y = nil
+local full_window_width = nil
+local full_window_height = nil
+
+local compact_window_x = nil
+local compact_window_y = nil
+local compact_window_width = nil
+local compact_window_height = nil
+
 local last_saved_window_x = nil
 local last_saved_window_y = nil
 local last_saved_window_width = nil
@@ -52,6 +59,7 @@ local queue_start_tac_when_started = false
 local queue_keep_tac_running_after_complete = false
 local queue_tac_started_by_ptie = false
 local persistence_recovery_pending = false
+local persistence_ready = false
 
 -- Forward declarations.
 local stage_selected_item
@@ -1013,6 +1021,10 @@ local function persistence_split_tab(line)
 end
 
 save_persistent_state = function(reason)
+    if not persistence_ready then
+        return false
+    end
+
     local path = persistence_path()
     local tmp = path .. '.tmp'
     local f, err = io.open(tmp, 'w')
@@ -1029,10 +1041,14 @@ save_persistent_state = function(reason)
     f:write('start_tac=', tostring(queue_start_tac_when_started), '\n')
     f:write('keep_tac_running=', tostring(queue_keep_tac_running_after_complete), '\n')
     f:write('compact_mode=', tostring(compact_mode), '\n')
-    f:write('window_x=', tostring(persisted_window_x or ''), '\n')
-    f:write('window_y=', tostring(persisted_window_y or ''), '\n')
-    f:write('window_width=', tostring(persisted_window_width or ''), '\n')
-    f:write('window_height=', tostring(persisted_window_height or ''), '\n')
+    f:write('full_window_x=', tostring(full_window_x or ''), '\n')
+    f:write('full_window_y=', tostring(full_window_y or ''), '\n')
+    f:write('full_window_width=', tostring(full_window_width or ''), '\n')
+    f:write('full_window_height=', tostring(full_window_height or ''), '\n')
+    f:write('compact_window_x=', tostring(compact_window_x or ''), '\n')
+    f:write('compact_window_y=', tostring(compact_window_y or ''), '\n')
+    f:write('compact_window_width=', tostring(compact_window_width or ''), '\n')
+    f:write('compact_window_height=', tostring(compact_window_height or ''), '\n')
     f:write('recovery_pending=', tostring(recovery_pending), '\n')
     f:write('next_id=', tostring(queue_next_id), '\n')
 
@@ -1084,6 +1100,7 @@ local function load_persistent_state()
     local path = persistence_path()
     local f = io.open(path, 'r')
     if not f then
+        persistence_ready = true
         log(string.format('PERSIST LOAD: no saved state for this character (%s).', tostring(path)), true)
         return false
     end
@@ -1093,10 +1110,14 @@ local function load_persistent_state()
     local loaded_start_tac = queue_start_tac_when_started
     local loaded_keep_tac = queue_keep_tac_running_after_complete
     local loaded_compact = compact_mode
-    local loaded_window_x = nil
-    local loaded_window_y = nil
-    local loaded_window_width = nil
-    local loaded_window_height = nil
+    local loaded_full_window_x = nil
+    local loaded_full_window_y = nil
+    local loaded_full_window_width = nil
+    local loaded_full_window_height = nil
+    local loaded_compact_window_x = nil
+    local loaded_compact_window_y = nil
+    local loaded_compact_window_width = nil
+    local loaded_compact_window_height = nil
     local loaded_recovery = false
     local format_version = nil
 
@@ -1110,14 +1131,22 @@ local function load_persistent_state()
             loaded_keep_tac = persistence_bool(value)
         elseif key == 'compact_mode' then
             loaded_compact = persistence_bool(value)
-        elseif key == 'window_x' then
-            loaded_window_x = tonumber(value)
-        elseif key == 'window_y' then
-            loaded_window_y = tonumber(value)
-        elseif key == 'window_width' then
-            loaded_window_width = tonumber(value)
-        elseif key == 'window_height' then
-            loaded_window_height = tonumber(value)
+        elseif key == 'full_window_x' then
+            loaded_full_window_x = tonumber(value)
+        elseif key == 'full_window_y' then
+            loaded_full_window_y = tonumber(value)
+        elseif key == 'full_window_width' then
+            loaded_full_window_width = tonumber(value)
+        elseif key == 'full_window_height' then
+            loaded_full_window_height = tonumber(value)
+        elseif key == 'compact_window_x' then
+            loaded_compact_window_x = tonumber(value)
+        elseif key == 'compact_window_y' then
+            loaded_compact_window_y = tonumber(value)
+        elseif key == 'compact_window_width' then
+            loaded_compact_window_width = tonumber(value)
+        elseif key == 'compact_window_height' then
+            loaded_compact_window_height = tonumber(value)
         elseif key == 'recovery_pending' then
             loaded_recovery = persistence_bool(value)
         elseif key == 'next_id' then
@@ -1155,6 +1184,7 @@ local function load_persistent_state()
     f:close()
 
     if format_version ~= 1 then
+        persistence_ready = true
         log(string.format(
             'PERSIST LOAD ERROR: unsupported format=%s path=%s; saved state ignored.',
             tostring(format_version), tostring(path)
@@ -1169,20 +1199,34 @@ local function load_persistent_state()
     compact_mode = loaded_compact
     persistence_recovery_pending = loaded_recovery
 
-    persisted_window_x = loaded_window_x
-    persisted_window_y = loaded_window_y
-    persisted_window_width = loaded_window_width
-    persisted_window_height = loaded_window_height
-    last_saved_window_x = loaded_window_x
-    last_saved_window_y = loaded_window_y
-    last_saved_window_width = loaded_window_width
-    last_saved_window_height = loaded_window_height
+    full_window_x = loaded_full_window_x
+    full_window_y = loaded_full_window_y
+    full_window_width = loaded_full_window_width
+    full_window_height = loaded_full_window_height
+    compact_window_x = loaded_compact_window_x
+    compact_window_y = loaded_compact_window_y
+    compact_window_width = loaded_compact_window_width
+    compact_window_height = loaded_compact_window_height
 
-    if loaded_window_x and loaded_window_y then
-        window_pos_pending = { x = loaded_window_x, y = loaded_window_y }
+    local restore_x = compact_mode and compact_window_x or full_window_x
+    local restore_y = compact_mode and compact_window_y or full_window_y
+    local restore_w = compact_mode and compact_window_width or full_window_width
+    local restore_h = compact_mode and compact_window_height or full_window_height
+
+    last_saved_window_x = restore_x
+    last_saved_window_y = restore_y
+    last_saved_window_width = restore_w
+    last_saved_window_height = restore_h
+
+    if restore_x and restore_y then
+        window_pos_pending = { x = restore_x, y = restore_y }
     end
-    if loaded_window_width and loaded_window_height then
-        window_resize_pending = { width = loaded_window_width, height = loaded_window_height }
+    if restore_w and restore_h then
+        window_resize_pending = { width = restore_w, height = restore_h }
+    elseif compact_mode then
+        window_resize_pending = { width = 460, height = 310 }
+    else
+        window_resize_pending = { width = 1000, height = 650 }
     end
 
     queue_running = false
@@ -1215,14 +1259,18 @@ local function load_persistent_state()
         queue_message = 'Queue is empty.'
     end
 
+    persistence_ready = true
+
     log(string.format(
-        'PERSIST LOAD: path=%s entries=%d start_tac=%s keep_tac_running=%s compact=%s window=(%s,%s %sx%s) recovery_pending=%s',
+        'PERSIST LOAD: path=%s entries=%d start_tac=%s keep_tac_running=%s compact=%s full_window=(%s,%s %sx%s) compact_window=(%s,%s %sx%s) recovery_pending=%s',
         tostring(path), #queue_entries,
         tostring(queue_start_tac_when_started),
         tostring(queue_keep_tac_running_after_complete),
         tostring(compact_mode),
-        tostring(persisted_window_x), tostring(persisted_window_y),
-        tostring(persisted_window_width), tostring(persisted_window_height),
+        tostring(full_window_x), tostring(full_window_y),
+        tostring(full_window_width), tostring(full_window_height),
+        tostring(compact_window_x), tostring(compact_window_y),
+        tostring(compact_window_width), tostring(compact_window_height),
         tostring(persistence_recovery_pending)
     ), true)
     return true
@@ -3159,10 +3207,20 @@ local function draw_compact_ui()
     ImGui.Text(string.format('%s   |   %s @ %s', VERSION, get_character_name(), get_server_name()))
     ImGui.SameLine()
     if ImGui.Button('Full Mode') then
+        capture_window_geometry()
         compact_mode = false
-        persisted_window_width = 1000
-        persisted_window_height = 650
-        window_resize_pending = { width = 1000, height = 650 }
+        local restore_x = full_window_x
+        local restore_y = full_window_y
+        local restore_w = full_window_width or 1000
+        local restore_h = full_window_height or 650
+        if restore_x and restore_y then
+            window_pos_pending = { x = restore_x, y = restore_y }
+        end
+        window_resize_pending = { width = restore_w, height = restore_h }
+        last_saved_window_x = restore_x
+        last_saved_window_y = restore_y
+        last_saved_window_width = restore_w
+        last_saved_window_height = restore_h
         save_persistent_state('full mode selected')
     end
 
@@ -3262,10 +3320,17 @@ local function capture_window_geometry()
     x, y, w, h = tonumber(x), tonumber(y), tonumber(w), tonumber(h)
     if not x or not y or not w or not h then return end
 
-    persisted_window_x = x
-    persisted_window_y = y
-    persisted_window_width = w
-    persisted_window_height = h
+    if compact_mode then
+        compact_window_x = x
+        compact_window_y = y
+        compact_window_width = w
+        compact_window_height = h
+    else
+        full_window_x = x
+        full_window_y = y
+        full_window_width = w
+        full_window_height = h
+    end
 
     local changed =
         last_saved_window_x ~= x
@@ -3279,7 +3344,7 @@ local function capture_window_geometry()
         last_saved_window_width = w
         last_saved_window_height = h
         last_window_geometry_save_ms = now_ms
-        save_persistent_state('window geometry changed')
+        save_persistent_state(compact_mode and 'compact window geometry changed' or 'full window geometry changed')
     end
 end
 
@@ -3307,10 +3372,20 @@ local function draw_ui()
             ImGui.Text(string.format('%s   |   %s @ %s', VERSION, get_character_name(), get_server_name()))
         ImGui.SameLine()
         if ImGui.Button('Compact Mode') then
+            capture_window_geometry()
             compact_mode = true
-            persisted_window_width = 460
-            persisted_window_height = 310
-            window_resize_pending = { width = 460, height = 310 }
+            local restore_x = compact_window_x
+            local restore_y = compact_window_y
+            local restore_w = compact_window_width or 460
+            local restore_h = compact_window_height or 310
+            if restore_x and restore_y then
+                window_pos_pending = { x = restore_x, y = restore_y }
+            end
+            window_resize_pending = { width = restore_w, height = restore_h }
+            last_saved_window_x = restore_x
+            last_saved_window_y = restore_y
+            last_saved_window_width = restore_w
+            last_saved_window_height = restore_h
             save_persistent_state('compact mode selected')
         end
 
@@ -3623,8 +3698,6 @@ end
 mq.bind('/ptie', ptie_command)
 mq.event('PTIE_TAC_STATUS', '#*#[Triune] status: #1#, mode: #*#', tac_status_event)
 
-mq.imgui.init(SCRIPT_NAME, draw_ui)
-
 log(string.format('%s %s loaded', SCRIPT_NAME, VERSION), true)
 log('v1.1 includes v1.0.1 fixes: static changelog/build notes are startup-only instead of repeating on refresh; TAC monitoring text now reports queue-started TAC unambiguously; new items may be appended to the future queue while another row is ACTIVE; queue-owned TAC is explicitly restarted and verified after each completed-item handoff before the queue continues; optional keep-TAC-running behavior leaves queue-owned TAC running after successful queue completion.', true)
 log('v1.1 worn-source support: equipped UPGRADABLE items in worn slots 0-20 may be staged/queued; if powersource is occupied, its original item is parked in a separately verified safe inventory slot rather than the worn source slot.', true)
@@ -3648,10 +3721,11 @@ log('v1.1 polling behavior: normal steady-state loop cadence is 200 ms; bounded 
 log('v1.1 scanner behavior: startup/refresh reads only core classification/identity/container fields and writes one concise log line per item; full property dumps are selected-item/on-demand only.', true)
 log('v1.1 queue enabled: ordered per-entry targets, including the same physical item queued Base->Enchanted and later Enchanted->Legendary; queue advances only at verified safe handoff points.', true)
 log('v1.1 queue resolver: remembered inventory location remains a hint; stale locations are re-resolved by BaseID/name/tier.', true)
-log('v1.1 persistence: queue entries, order/targets, TAC queue preferences, Compact/Full mode, and window position/size are saved per character/server and restored on Lua restart. Saved ACTIVE work is never blindly resumed.', true)
+log('v1.1 persistence: queue entries, order/targets, TAC queue preferences, Compact/Full mode, and separate Full/Compact window position/size are saved per character/server and restored on Lua restart. Persistence is loaded before ImGui starts so an early UI frame cannot overwrite the saved queue with empty runtime state. Saved ACTIVE work is never blindly resumed.', true)
 log('v1.0.1 inherited Legendary cursor recovery: if TAC or another actor auto-inventories the exact expected Legendary before PTItemEvolver can place it, PTItemEvolver searches inventory and accepts exactly one verified Legendary match instead of immediately erroring.', true)
 refresh_inventory()
 load_persistent_state()
+mq.imgui.init(SCRIPT_NAME, draw_ui)
 
 while running do
     if not window_open then running = false break end
