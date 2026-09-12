@@ -20,8 +20,9 @@ It helps safely queue eligible items for evolution from Base to Enchanted or Leg
 - Safely restores items after reaching their target
 - Compact Mode for normal operation
 - Full Mode for queue management and diagnostics
-- Verbose logging enabled by default
+- Detailed diagnostic logging available on demand
 - Triune AutoCombat integration
+- Live-state recovery and reconciliation
 
 ## How Item Evolution Works
 
@@ -113,6 +114,8 @@ Use **Pause After Current** to allow the current item to finish before pausing t
 
 A paused queue can later be resumed with **Resume Queue**.
 
+If a transaction enters an error state, **Recover / Re-evaluate** can reconcile the exact item against live powersource, cursor, and inventory state before deciding whether to resume monitoring or return the queue entry to a safe paused state.
+
 ## Compact Mode
 
 Compact Mode provides a smaller operational view while the queue is running.
@@ -125,6 +128,7 @@ It displays:
 - Current movement state
 - Queue preview
 - Restore control
+- Recover / Re-evaluate when applicable
 - Pause After Current
 - Start / Resume controls when applicable
 
@@ -150,7 +154,7 @@ It does not use a bare:
 
 PTItemEvolver tracks whether TAC was originally running and only restores TAC when appropriate.
 
-If PTItemEvolver encounters an error during an item transaction, it leaves TAC paused rather than risking unsafe item movement.
+PTItemEvolver does not treat every item transaction error as a reason to stop TAC. TAC is held only while PTItemEvolver has a verified exclusive claim on the transaction item on cursor. If no PTItemEvolver-owned cursor item exists, an ItemEvolver error leaves TAC running or restores it when appropriate.
 
 ## Safety
 
@@ -192,6 +196,8 @@ If an item has moved since it was queued, PTItemEvolver attempts to resolve it u
 
 When multiple truly equivalent copies exist, PTItemEvolver selects one deterministically.
 
+For v1.2 reconciliation and recovery, PTItemEvolver requires exact agreement on tier-derived item ID, BaseID, normalized name, and expected tier before adopting a live item.
+
 ## Project Triune Tier Detection
 
 PTItemEvolver uses Project Triune's tier ID pattern:
@@ -226,17 +232,32 @@ Those values are not reliable for Project Triune item evolution.
 
 ## Consume Experience
 
-PTItemEvolver v1.0 does not purchase or automatically activate Consume Experience.
+PTItemEvolver does not purchase or automatically activate Consume Experience.
 
 Item evolution is handled passively through normal gameplay.
 
-Consume Experience support may be considered separately in the future.
+## Recovery and Reconciliation
+
+v1.2 adds live-state reconciliation for interrupted or uncertain queue states.
+
+PTItemEvolver can safely:
+
+- Resume a queued item that is already in the powersource slot
+- Reconcile an exact active transaction item that remains in powersource
+- Recover an exact queued item that has been returned to normal inventory
+- Reset a recovered queue entry to a safe paused state
+- Continue only when the expected item identity can be verified
+- Handle cases where TAC or another actor may have moved the expected Legendary before PTItemEvolver observed it on cursor
+
+Use **Recover / Re-evaluate** when ItemEvolver is in an error state and the physical item state has been made safe or restored manually.
+
+Recovery work is deferred outside the ImGui render callback so TAC status checks, event processing, and bounded waits do not execute inside the UI callback.
 
 ## Logging
 
-Verbose logging is enabled by default.
+Detailed diagnostic logging is available, but verbose debug logging is disabled by default in the release build.
 
-Logs include information such as:
+When enabled, logs include information such as:
 
 - Script version
 - Queue state
@@ -271,7 +292,7 @@ Available commands include:
 Current release:
 
 ```text
-v1.0
+v1.2
 ```
 
 ## Compatibility
