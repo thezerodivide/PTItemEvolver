@@ -2,12 +2,12 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local SCRIPT_NAME = 'PTItemEvolver'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 local WINDOW_TITLE = string.format('%s %s - Automatic Item Evolver', SCRIPT_NAME, VERSION)
 
 local running = true
 local window_open = true
-local debug_enabled = true
+local debug_enabled = false
 local filter_text = ''
 local show_all_items = false
 local compact_mode = false
@@ -45,6 +45,7 @@ local pending_action = nil
 local pending_stage_index = nil
 local pending_monitor_index = nil
 local pending_final_target_tier = nil
+local pending_recover_reason = nil
 local tac_status_reply = nil
 
 local queue_entries = {}
@@ -669,6 +670,87 @@ end
 
 local query_tac_state
 local stop_queue_owned_tac
+local queue_resolve_inventory_index
+local complete_active_queue_entry
+local finalize_passive_transition
+local reconcile_entry_against_reality
+local recover_queue_state
+local finish_recovered_legendary_from_inventory
+
+local function verified_cursor_owned_transaction_item()
+    local tx = staged_transaction
+    local cur = cursor_item()
+    if not tx or not cur then return false, nil end
+
+    if tx.selected and exact_item_match(cur, tx.selected) then
+        return true, 'selected transaction item'
+    end
+
+    if tx.original_powersource and exact_item_match(cur, tx.original_powersource) then
+        return true, 'original powersource item'
+    end
+
+    if tx.passive_monitor and expected_transition_match(cur, tx, 'Legendary') then
+        return true, 'expected Legendary transition item'
+    end
+
+    return false, nil
+end
+
+local function restore_tac_after_error_if_safe(reason)
+    local owned, owned_reason = verified_cursor_owned_transaction_item()
+    if owned then
+        log(string.format(
+            'ERROR TAC HOLD: reason=%s cursor_owner=%s; TAC remains paused because PTItemEvolver has a verified exclusive cursor claim.',
+            tostring(reason or '<none>'), tostring(owned_reason or '<unknown>')
+        ), true)
+        return false, 'cursor-owned'
+    end
+
+    local should_run = queue_tac_started_by_ptie
+        or (staged_transaction and staged_transaction.tac_original_state == 'running')
+
+    if not should_run then
+        log(string.format(
+            'ERROR TAC POLICY: reason=%s no PTItemEvolver cursor claim and TAC was not known to be running/queue-owned; leaving TAC state unchanged.',
+            tostring(reason or '<none>')
+        ), true)
+        return true, 'unchanged'
+    end
+
+    local state = query_tac_state()
+    if state == 'running' then
+        log(string.format(
+            'ERROR TAC POLICY: reason=%s TAC already running; ItemEvolver error does not stop combat automation.',
+            tostring(reason or '<none>')
+        ), true)
+        return true, state
+    end
+
+    if state == 'paused' then
+        log(string.format(
+            'ERROR TAC RESUME: reason=%s no verified PTItemEvolver cursor claim; issuing /ac run.',
+            tostring(reason or '<none>')
+        ), true)
+        mq.cmd('/ac run')
+        mq.delay(100)
+        state = query_tac_state()
+    end
+
+    if state == 'running' then
+        log(string.format(
+            'ERROR TAC RESUME VERIFIED: reason=%s TAC is running while ItemEvolver remains in ERROR.',
+            tostring(reason or '<none>')
+        ), true)
+        return true, state
+    end
+
+    log(string.format(
+        'ERROR TAC RESUME FAILED: reason=%s status=%s. ItemEvolver remains in ERROR; TAC state could not be verified.',
+        tostring(reason or '<none>'), tostring(state)
+    ), true)
+    return false, state
+end
 
 local function set_move_error(msg)
     move_state = 'ERROR'
@@ -687,11 +769,15 @@ local function set_move_error(msg)
         queue_running = false
         queue_pause_after_current = false
         queue_advance_pending = false
-        stop_queue_owned_tac('queue error')
         queue_state = 'ERROR'
         queue_message = 'Queue stopped because the active item transaction entered ERROR: ' .. move_message
         log('QUEUE ERROR: ' .. queue_message, true)
-        active_queue_entry_id = nil
+
+        -- ERROR is orthogonal to TAC state. Only a verified PTItemEvolver-owned
+        -- cursor item justifies keeping TAC paused.
+        restore_tac_after_error_if_safe('queue error')
+    else
+        restore_tac_after_error_if_safe('non-queue move error')
     end
 end
 
@@ -1290,11 +1376,26 @@ local function same_record_location(rec, loc)
         and tonumber(rec.bag_slot or -1) == tonumber(loc.bag_slot or -2)
 end
 
+local function queue_expected_id(entry, expected_tier)
+    if not entry then return nil end
+    local base_id = tonumber(entry.normalized_base_id)
+    if not base_id then return nil end
+    if expected_tier == 'Base' then return base_id end
+    if expected_tier == 'Enchanted' then return base_id + TIER_ENCHANTED_OFFSET end
+    if expected_tier == 'Legendary' then return base_id + TIER_LEGENDARY_OFFSET end
+    return nil
+end
+
 local function queue_record_matches_entry(rec, entry, expected_tier)
     if not rec or not entry then return false end
     if rec.normalized_base_id ~= entry.normalized_base_id then return false end
     if rec.normalized_base_name ~= entry.normalized_base_name then return false end
     if expected_tier and rec.detected_tier ~= expected_tier then return false end
+
+    local expected_id = expected_tier and queue_expected_id(entry, expected_tier) or nil
+    if expected_id and tonumber(rec.id) ~= expected_id then
+        return false
+    end
     if rec.status ~= 'UPGRADABLE' then return false end
     if rec.location_type ~= 'BAG' and rec.location_type ~= 'TOP' and rec.location_type ~= 'WORN' then return false end
     if rec.location_type == 'WORN' and tonumber(rec.top_slot or -1) == 21 then return false end
@@ -1421,8 +1522,16 @@ local function find_exact_legendary_inventory_match(tx)
         local name_ok = expected_base_name ~= '' and rec.normalized_base_name == expected_base_name
         local tier_ok = rec.detected_tier == 'Legendary'
 
-        if tier_ok and ((expected_id and id_ok) or (base_ok and name_ok)) then
+        -- Exact tier-derived ID is load-bearing for reconciliation. Base/name
+        -- agreement is diagnostic corroboration, never a substitute for ID.
+        if tier_ok and id_ok and base_ok and name_ok then
             matches[#matches + 1] = rec
+        elseif tier_ok and base_ok and name_ok and not id_ok then
+            log(string.format(
+                'RESOLVER REJECTED LOOSE LEGENDARY MATCH: expected_id=%s candidate_id=%s base_id=%s base_name=%s location=%s',
+                tostring(expected_id), tostring(rec.id), tostring(rec.normalized_base_id),
+                tostring(rec.normalized_base_name), tostring(rec.location)
+            ), true)
         end
     end
 
@@ -1501,7 +1610,331 @@ local function recover_legendary_from_inventory(tx, reason)
     return true, recovered_loc
 end
 
-local function queue_resolve_inventory_index(entry)
+local function entry_matches_powersource_tier(entry, allowed_tier)
+    if not entry then return false, nil end
+    local ps = powersource_item()
+    if not ps then return false, nil end
+
+    local snap = snapshot_tier(ps)
+    if not snap then return false, nil end
+    if snap.detected_tier ~= allowed_tier then return false, snap end
+    if snap.normalized_base_id ~= entry.normalized_base_id then return false, snap end
+    if snap.normalized_base_name ~= entry.normalized_base_name then return false, snap end
+
+    local expected_id = queue_expected_id(entry, allowed_tier)
+    if not expected_id or tonumber(snap.id) ~= tonumber(expected_id) then
+        log(string.format(
+            'RECONCILE POWERSOURCE REJECTED: queue_id=%s tier=%s expected_id=%s actual_id=%s base_id=%s base_name=%s',
+            tostring(entry.id), tostring(allowed_tier), tostring(expected_id), tostring(snap.id),
+            tostring(snap.normalized_base_id), tostring(snap.normalized_base_name)
+        ), true)
+        return false, snap
+    end
+
+    return true, snap
+end
+
+local function make_adopted_transaction(entry, ps_snap)
+    if not entry or not ps_snap then return nil end
+
+    local current_tier = ps_snap.detected_tier
+    local final_target = entry.target_tier
+    local immediate_target =
+        current_tier == 'Base' and 'Enchanted'
+        or current_tier == 'Enchanted' and 'Legendary'
+        or nil
+
+    if not immediate_target then return nil end
+    if final_target == 'Enchanted' and current_tier ~= 'Base' then return nil end
+    if final_target == 'Legendary' and current_tier ~= 'Base' and current_tier ~= 'Enchanted' then return nil end
+
+    local selected_snap = snapshot_item(powersource_item())
+    if not selected_snap then return nil end
+
+    return {
+        selected = selected_snap,
+        current = selected_snap,
+        source = clone_location(entry.current_location),
+        original_powersource = nil,
+        powersource_temp = nil,
+        tac_original_state = query_tac_state(),
+        normalized_base_name = entry.normalized_base_name,
+        normalized_base_id = entry.normalized_base_id,
+        start_tier = current_tier,
+        final_target_tier = final_target,
+        target_tier = immediate_target,
+        expected_enchanted_id = entry.normalized_base_id + TIER_ENCHANTED_OFFSET,
+        expected_legendary_id = entry.normalized_base_id + TIER_LEGENDARY_OFFSET,
+        passive_monitor = true,
+        tac_resumed_for_monitor = true,
+        queue_entry_id = entry.id,
+        adopted_from_reality = true,
+    }
+end
+
+finish_recovered_legendary_from_inventory = function(tx, recovered_loc, reason)
+    if not tx or not recovered_loc then
+        return set_move_error('Recovered Legendary completion was requested without a verified transaction/location.')
+    end
+
+    local recovered_item = item_at_location(recovered_loc)
+    if not recovered_item or not expected_transition_match(recovered_item, tx, 'Legendary') then
+        return set_move_error('Recovered Legendary location no longer contains the exact expected Legendary.')
+    end
+
+    local legendary_snap = snapshot_item(recovered_item)
+    tx.selected = legendary_snap
+    tx.current = legendary_snap
+    tx.final_location = clone_location(recovered_loc)
+
+    log(string.format(
+        'RECONCILE LEGENDARY SUCCESS: reason=%s exact expected Legendary already in inventory at %s; no Legendary placement action needed.',
+        tostring(reason or '<none>'), tostring(recovered_loc.label or '<unknown>')
+    ), true)
+
+    -- If a real powersource was parked by the live transaction, restoring it is
+    -- still a cursor-owning action and therefore requests its own TAC pause.
+    if tx.original_powersource then
+        local ps_temp = tx.powersource_temp or tx.source
+        if not exact_item_match(item_at_location(ps_temp), tx.original_powersource) then
+            return set_move_error('Recovered Legendary is safe in inventory, but original powersource is not verified in its reserved temporary location.')
+        end
+
+        local tac_ok, tac_err = require_tac_paused(nil)
+        if not tac_ok then
+            return set_move_error('Recovered Legendary is safe, but TAC could not be paused for original powersource restoration: ' .. tostring(tac_err))
+        end
+
+        notify_location(ps_temp)
+        if not wait_for(function()
+            return exact_item_match(cursor_item(), tx.original_powersource)
+                and item_at_location(ps_temp) == nil
+        end) then
+            return set_move_error('Recovered Legendary is safe, but pickup of the original powersource did not verify.')
+        end
+
+        mq.cmd('/itemnotify powersource leftmouseup')
+        if not wait_for(function()
+            return cursor_is_empty() and exact_item_match(powersource_item(), tx.original_powersource)
+        end) then
+            return set_move_error('Recovered Legendary is safe, but restoration of the original powersource did not verify.')
+        end
+    elseif powersource_item() ~= nil then
+        return set_move_error('Recovered Legendary is safe in inventory, but powersource is unexpectedly occupied.')
+    end
+
+    tx.verified_final_target = 'Legendary'
+    staged_transaction = nil
+    move_state = 'RESTORED'
+    move_message = string.format(
+        '%s was already safely inventoried at %s and was adopted as the verified Legendary result.',
+        tostring(legendary_snap.name), tostring(recovered_loc.label or '<unknown>')
+    )
+    log('RECONCILE LEGENDARY COMPLETE: ' .. move_message, true)
+
+    local queue_owned = complete_active_queue_entry(tx, recovered_loc, 'Legendary')
+    if not queue_owned then
+        refresh_inventory()
+    end
+
+    restore_tac_after_error_if_safe('reconciled Legendary completion')
+    return true
+end
+
+local function reset_entry_to_queued_from_live_inventory(entry, idx, reason)
+    local rec = idx and items[idx] or nil
+    if not entry or not rec then return false end
+
+    entry.status = 'QUEUED'
+    entry.message = 'Recovered: item is safely back in normal inventory.'
+    entry.current_location = snapshot_rec_location(rec)
+    entry.starting_tier = rec.detected_tier
+    staged_transaction = nil
+    active_queue_entry_id = nil
+    queue_running = false
+    queue_advance_pending = false
+    queue_state = 'PAUSED'
+    queue_message = 'Recovery succeeded. Item is safely in inventory; press Resume Queue to continue.'
+    move_state = 'IDLE'
+    move_message = queue_message
+    persistence_recovery_pending = false
+
+    log(string.format(
+        'RECONCILE INVENTORY RESET: reason=%s queue_id=%s item=%s tier=%s location=%s result=QUEUED',
+        tostring(reason or '<none>'), tostring(entry.id), tostring(entry.display_name),
+        tostring(rec.detected_tier), tostring(rec.location)
+    ), true)
+    save_persistent_state('reconciled item back to queue')
+    restore_tac_after_error_if_safe('reconciled item back to inventory')
+    return true
+end
+
+reconcile_entry_against_reality = function(entry, reason)
+    if not entry then
+        return false, 'No queue entry is available for reconciliation.'
+    end
+
+    log(string.format(
+        'RECONCILE START: reason=%s queue_id=%s item=%s start_tier=%s target=%s status=%s active_id=%s tx=%s cursor={%s} powersource={%s}',
+        tostring(reason or '<none>'), tostring(entry.id), tostring(entry.display_name),
+        tostring(entry.starting_tier), tostring(entry.target_tier), tostring(entry.status),
+        tostring(active_queue_entry_id), tostring(staged_transaction ~= nil),
+        item_diag(cursor_item()), item_diag(powersource_item())
+    ), true)
+
+    local tx = staged_transaction
+
+    -- Existing transaction: first trust exact live transaction identity.
+    if tx and (not tx.queue_entry_id or tx.queue_entry_id == entry.id) then
+        if exact_item_match(powersource_item(), tx.selected) then
+            entry.status = 'ACTIVE'
+            entry.message = 'Recovered: exact transaction item remains in powersource.'
+            active_queue_entry_id = entry.id
+            queue_running = true
+            queue_advance_pending = false
+            queue_state = 'RUNNING'
+            move_state = 'MONITORING_PROGRESS'
+            move_message = entry.message
+            persistence_recovery_pending = false
+            log('RECONCILE RESULT: ACTIVE_POWERSOURCE_EXACT; resuming monitor.', true)
+            save_persistent_state('reconciled active powersource transaction')
+            restore_tac_after_error_if_safe('reconciled active powersource transaction')
+            return true, 'monitoring'
+        end
+
+        if tx.target_tier == 'Enchanted' and expected_transition_match(powersource_item(), tx, 'Enchanted') then
+            log('RECONCILE RESULT: EXPECTED_ENCHANTED_TRANSITION_IN_POWERSOURCE.', true)
+            move_state = 'MONITORING_PROGRESS'
+            return true, finalize_passive_transition(tx)
+        end
+
+        if tx.target_tier == 'Legendary' then
+            local recovered, recovered_loc = recover_legendary_from_inventory(tx, reason or 'manual/runtime reconciliation')
+            if recovered then
+                return finish_recovered_legendary_from_inventory(tx, recovered_loc, reason)
+            end
+        end
+
+        local idx = queue_resolve_inventory_index(entry)
+        if idx then
+            return reset_entry_to_queued_from_live_inventory(entry, idx, reason)
+        end
+
+        local owned, owned_reason = verified_cursor_owned_transaction_item()
+        if owned then
+            return false, 'PTItemEvolver still owns the cursor with ' .. tostring(owned_reason) .. '; recovery cannot release the transaction yet.'
+        end
+    end
+
+    -- No usable live transaction: powersource adoption is a normal startup/manual recovery path.
+    local allowed_tiers = {}
+    if entry.target_tier == 'Enchanted' then
+        allowed_tiers = { 'Base' }
+    else
+        allowed_tiers = { 'Base', 'Enchanted' }
+    end
+
+    for _, tier in ipairs(allowed_tiers) do
+        local matches, ps_snap = entry_matches_powersource_tier(entry, tier)
+        if matches then
+            local adopted = make_adopted_transaction(entry, ps_snap)
+            if not adopted then
+                return false, 'Powersource identity matched, but a valid monitoring transaction could not be reconstructed.'
+            end
+
+            staged_transaction = adopted
+            active_queue_entry_id = entry.id
+            entry.status = 'ACTIVE'
+            entry.starting_tier = tier
+            entry.message = 'Adopted verified queue item already in powersource.'
+            queue_running = true
+            queue_advance_pending = false
+            queue_state = 'RUNNING'
+            move_state = 'MONITORING_PROGRESS'
+            move_message = string.format(
+                '%s was already in powersource at %s; adopted and monitoring toward %s.',
+                tostring(entry.display_name), tostring(reason or 'reconciliation'), tostring(entry.target_tier)
+            )
+            persistence_recovery_pending = false
+
+            log(string.format(
+                'RECONCILE RESULT: ADOPT_POWERSOURCE queue_id=%s tier=%s expected_id=%s actual_id=%s duplicate_policy=EQUIVALENT_COPIES_FUNGIBLE',
+                tostring(entry.id), tostring(tier), tostring(queue_expected_id(entry, tier)), tostring(ps_snap.id)
+            ), true)
+            save_persistent_state('adopted queue item already in powersource')
+            restore_tac_after_error_if_safe('adopted queue item already in powersource')
+            return true, 'monitoring'
+        end
+    end
+
+    -- Exact final Legendary in normal inventory satisfies a Legendary queue row.
+    if entry.target_tier == 'Legendary' then
+        local synthetic_tx = {
+            queue_entry_id = entry.id,
+            normalized_base_id = entry.normalized_base_id,
+            normalized_base_name = entry.normalized_base_name,
+            expected_legendary_id = entry.normalized_base_id + TIER_LEGENDARY_OFFSET,
+            expected_enchanted_id = entry.normalized_base_id + TIER_ENCHANTED_OFFSET,
+            target_tier = 'Legendary',
+            final_target_tier = 'Legendary',
+            passive_monitor = true,
+            original_powersource = nil,
+        }
+        local recovered, recovered_loc = recover_legendary_from_inventory(synthetic_tx, reason or 'reconciliation without transaction')
+        if recovered then
+            synthetic_tx.verified_final_target = 'Legendary'
+            active_queue_entry_id = entry.id
+            entry.status = 'ACTIVE'
+            staged_transaction = nil
+            log('RECONCILE RESULT: FINAL_LEGENDARY_ALREADY_IN_INVENTORY.', true)
+            return finish_recovered_legendary_from_inventory(synthetic_tx, recovered_loc, reason)
+        end
+    end
+
+    local idx, resolve_err = queue_resolve_inventory_index(entry)
+    if idx then
+        return reset_entry_to_queued_from_live_inventory(entry, idx, reason)
+    end
+
+    return false, 'Live state could not be reconciled deterministically. ' .. tostring(resolve_err or '')
+end
+
+recover_queue_state = function(reason)
+    local entry = active_queue_entry_id and queue_entry_by_id(active_queue_entry_id) or nil
+
+    if not entry then
+        for _, candidate in ipairs(queue_entries) do
+            if candidate.status == 'ERROR' or candidate.status == 'ACTIVE' or candidate.status == 'QUEUED' then
+                entry = candidate
+                break
+            end
+        end
+    end
+
+    if not entry then
+        queue_message = 'Recover: no queue entry is available to reconcile.'
+        move_message = queue_message
+        return false
+    end
+
+    local ok, detail = reconcile_entry_against_reality(entry, reason or 'manual Recover')
+    if not ok then
+        queue_running = false
+        queue_state = 'ERROR'
+        move_state = 'ERROR'
+        queue_message = 'Recover could not reconcile live state: ' .. tostring(detail)
+        move_message = queue_message
+        entry.status = 'ERROR'
+        entry.message = queue_message
+        log('RECONCILE FAILED: ' .. queue_message, true)
+        restore_tac_after_error_if_safe('reconciliation failed')
+        return false
+    end
+
+    return true
+end
+
+queue_resolve_inventory_index = function(entry)
     if not entry then return nil, 'Missing queue entry.' end
 
     local expected_tier = entry.starting_tier
@@ -1512,8 +1945,9 @@ local function queue_resolve_inventory_index(entry)
         if live_rec and queue_record_matches_entry(live_rec, entry, expected_tier) then
             local idx = queue_cache_live_record(live_rec)
             log(string.format(
-                'QUEUE RESOLVE: id=%d item=%s expected_tier=%s remembered_location=%s result=REMEMBERED_MATCH',
+                'QUEUE RESOLVE: id=%d item=%s expected_tier=%s expected_id=%s remembered_location=%s result=EXACT_REMEMBERED_MATCH',
                 entry.id, tostring(entry.display_name), tostring(expected_tier),
+                tostring(queue_expected_id(entry, expected_tier)),
                 tostring(entry.current_location.label or '<nil>')
             ), true)
             return idx
@@ -1878,20 +2312,26 @@ local function start_queue()
         end
 
         if first_entry then
-            local recovered_idx, recovered_err = queue_resolve_inventory_index(first_entry)
-            if not recovered_idx then
+            local reconciled, detail = reconcile_entry_against_reality(first_entry, 'startup persisted recovery')
+            if not reconciled then
                 queue_state = 'PAUSED'
-                queue_message = 'Saved queue recovery is pending. The previously active item is not safely resolvable in normal worn/bag inventory. If it is still in powersource, move/restore it manually, then press Start Queue again. ' .. tostring(recovered_err or '')
+                queue_message = 'Saved queue recovery is pending. Live state could not yet be reconciled safely. ' .. tostring(detail or '')
                 log('PERSIST RECOVERY BLOCKED: ' .. queue_message, true)
                 return
             end
 
             persistence_recovery_pending = false
             log(string.format(
-                'PERSIST RECOVERY CLEARED: first queued item re-resolved safely at %s; queue may start normally.',
-                tostring(items[recovered_idx] and items[recovered_idx].location or '<unknown>')
+                'PERSIST RECOVERY CLEARED: first queued item reconciled against live reality; result=%s.',
+                tostring(detail or '<none>')
             ), true)
             save_persistent_state('recovery cleared')
+
+            -- Reconciliation may have adopted the item directly into an active
+            -- monitoring transaction. In that case Start Queue is already complete.
+            if staged_transaction and active_queue_entry_id == first_entry.id then
+                return
+            end
         else
             persistence_recovery_pending = false
             save_persistent_state('recovery cleared with empty queue')
@@ -1959,7 +2399,7 @@ local function resume_queue()
     log('QUEUE RESUME', true)
 end
 
-local function complete_active_queue_entry(tx, final_location, final_tier)
+complete_active_queue_entry = function(tx, final_location, final_tier)
     if not tx or not tx.queue_entry_id then return false end
     local entry = queue_entry_by_id(tx.queue_entry_id)
     if not entry then
@@ -2153,10 +2593,36 @@ local function process_queue_engine()
 
     local idx, resolve_err = queue_resolve_inventory_index(entry)
     if not idx then
+        -- An explicit Start/Resume is allowed to adopt the queued item if live
+        -- reality already has the exact expected item in powersource. This is
+        -- not automatic-on-load behavior: the user has explicitly asked the
+        -- queue to run, so reconciliation is the correct next step.
+        log(string.format(
+            'QUEUE RESOLVE MISS: id=%s item=%s normal inventory lookup failed; attempting live-state reconciliation before ERROR. resolver=%s',
+            tostring(entry.id), tostring(entry.display_name), tostring(resolve_err or '<none>')
+        ), true)
+
+        local reconciled, detail = reconcile_entry_against_reality(
+            entry,
+            'explicit Start/Resume after normal inventory resolver miss'
+        )
+
+        if reconciled then
+            log(string.format(
+                'QUEUE START/RESUME RECONCILED: id=%s item=%s result=%s state=%s active_id=%s staged=%s',
+                tostring(entry.id), tostring(entry.display_name), tostring(detail or '<none>'),
+                tostring(queue_state), tostring(active_queue_entry_id),
+                tostring(staged_transaction ~= nil)
+            ), true)
+            return
+        end
+
         active_queue_entry_id = entry.id
         return set_move_error(string.format(
-            'Queue cannot safely resolve %s. %s No item movement attempted.',
-            tostring(entry.display_name), tostring(resolve_err or 'Unknown resolver failure.')
+            'Queue cannot safely resolve %s. %s Reconciliation also failed: %s No item movement attempted.',
+            tostring(entry.display_name),
+            tostring(resolve_err or 'Unknown resolver failure.'),
+            tostring(detail or 'unknown reconciliation failure')
         ))
     end
 
@@ -2481,7 +2947,7 @@ end
 
 local restore_staged_item
 
-local function finalize_passive_transition(tx)
+finalize_passive_transition = function(tx)
     if not tx then return set_move_error('Passive completion called without a staged transaction.') end
 
     if tx.target_tier == 'Enchanted' then
@@ -2953,6 +3419,15 @@ local function monitor_passive_item()
             end
             if exact_item_match(powersource_item(), tx.selected) then return end
         end
+        local recovered, recovered_loc = recover_legendary_from_inventory(
+            tx,
+            'powersource emptied and TAC may have autoinventoried Legendary before cursor observation'
+        )
+        if recovered then
+            log('PHASE3 LEGENDARY SELF-HEAL: exact expected Legendary found in inventory after empty-slot grace; treating TAC autoinventory as successful transition.', true)
+            return finish_recovered_legendary_from_inventory(tx, recovered_loc, 'runtime TAC autoinventory self-heal')
+        end
+
         local final_ps = snapshot_item(powersource_item())
         local final_cur = snapshot_item(cursor_item())
         log(string.format('PHASE3 LEGENDARY EMPTY-SLOT ERROR: cursor=%s[%s], powersource=%s[%s].',
@@ -2960,7 +3435,7 @@ local function monitor_passive_item()
             tostring(final_cur and final_cur.id or '<empty>'),
             tostring(final_ps and final_ps.name or '<empty>'),
             tostring(final_ps and final_ps.id or '<empty>')), true)
-        return set_move_error('Power-source emptied while monitoring Legendary, but the exact expected Legendary did not settle on cursor.')
+        return set_move_error('Power-source emptied while monitoring Legendary, and the exact expected Legendary could not be reconciled on cursor or in inventory.')
     end
 
     local bad_ps = snapshot_item(ps)
@@ -2971,7 +3446,36 @@ local function monitor_passive_item()
         tostring(bad_ps and bad_ps.name or '<empty>'),
         tostring(bad_ps and bad_ps.id or '<empty>'),
         tostring(tx.expected_legendary_id)), true)
-    return set_move_error('Power-source contents changed unexpectedly while monitoring Enchanted -> Legendary. TAC remains paused; no recovery guessing was attempted.')
+
+    -- First attempt transaction-level Legendary recovery for BOTH queued and
+    -- manually staged items. This path needs only the live transaction identity,
+    -- so it should not depend on a queue entry existing.
+    local recovered, recovered_loc = recover_legendary_from_inventory(
+        tx,
+        'runtime unexpected Legendary state; checking inventory before queue-specific reconciliation'
+    )
+    if recovered then
+        log('PHASE3 LEGENDARY SELF-HEAL: exact expected Legendary found in inventory from unexpected-state branch; transaction recovered without requiring a queue entry.', true)
+        return finish_recovered_legendary_from_inventory(
+            tx,
+            recovered_loc,
+            'runtime unexpected Legendary state inventory recovery'
+        )
+    end
+
+    -- Queue-owned transactions get one additional opportunity to reconcile
+    -- broader live reality (for example, the queued item being back in normal
+    -- inventory or otherwise adoptable).
+    local active_entry = tx.queue_entry_id and queue_entry_by_id(tx.queue_entry_id) or nil
+    if active_entry then
+        local reconciled, detail = reconcile_entry_against_reality(active_entry, 'runtime unexpected Legendary state')
+        if reconciled then
+            log('PHASE3 LEGENDARY SELF-HEAL: reconciliation succeeded after unexpected state: ' .. tostring(detail), true)
+            return
+        end
+    end
+
+    return set_move_error('Power-source contents changed unexpectedly while monitoring Enchanted -> Legendary and could not be reconciled deterministically.')
 end
 
 restore_staged_item = function()
@@ -3192,8 +3696,16 @@ local function process_pending_action()
     elseif pending_action == 'restore' then
         pending_action = nil
         restore_staged_item()
+    elseif pending_action == 'recover' then
+        local reason = pending_recover_reason or 'deferred manual Recover'
+        pending_action = nil
+        pending_recover_reason = nil
+        log('RECOVER DEFERRED DISPATCH: executing outside ImGui callback. reason=' .. tostring(reason), true)
+        recover_queue_state(reason)
     end
 end
+
+local capture_window_geometry
 
 local function draw_compact_ui()
     local active_entry = active_queue_entry_id and queue_entry_by_id(active_queue_entry_id) or nil
@@ -3250,6 +3762,14 @@ local function draw_compact_ui()
 
     if move_message and move_message ~= '' then
         ImGui.TextWrapped(move_message)
+    end
+
+    if queue_state == 'ERROR' or move_state == 'ERROR' then
+        if ImGui.Button('Recover / Re-evaluate') and not pending_action then
+            pending_recover_reason = 'manual compact Recover button'
+            pending_action = 'recover'
+            log('RECOVER DEFERRED: compact UI requested recovery; main loop will execute it.', true)
+        end
     end
 
     ImGui.Separator()
@@ -3311,7 +3831,7 @@ local function draw_compact_ui()
 end
 
 
-local function capture_window_geometry()
+capture_window_geometry = function()
     local now_ms = math.floor((os.clock() or 0) * 1000)
     if now_ms - last_window_geometry_save_ms < 1000 then return end
 
@@ -3397,6 +3917,14 @@ local function draw_ui()
 
         if move_message and move_message ~= '' then
             ImGui.TextWrapped(move_message)
+        end
+
+        if queue_state == 'ERROR' or move_state == 'ERROR' then
+            if ImGui.Button('Recover / Re-evaluate') and not pending_action then
+                pending_recover_reason = 'manual full Recover button'
+                pending_action = 'recover'
+                log('RECOVER DEFERRED: full UI requested recovery; main loop will execute it.', true)
+            end
         end
 
         ImGui.Separator()
@@ -3721,7 +4249,10 @@ log('v1.1 polling behavior: normal steady-state loop cadence is 200 ms; bounded 
 log('v1.1 scanner behavior: startup/refresh reads only core classification/identity/container fields and writes one concise log line per item; full property dumps are selected-item/on-demand only.', true)
 log('v1.1 queue enabled: ordered per-entry targets, including the same physical item queued Base->Enchanted and later Enchanted->Legendary; queue advances only at verified safe handoff points.', true)
 log('v1.1 queue resolver: remembered inventory location remains a hint; stale locations are re-resolved by BaseID/name/tier.', true)
-log('v1.1 persistence: queue entries, order/targets, TAC queue preferences, Compact/Full mode, and separate Full/Compact window position/size are saved per character/server and restored on Lua restart. Persistence is loaded before ImGui starts so an early UI frame cannot overwrite the saved queue with empty runtime state. Saved ACTIVE work is never blindly resumed.', true)
+log('v1.2 reconciliation: ERROR no longer implies TAC pause. TAC is held only while PTItemEvolver has a verified exclusive cursor claim; otherwise an ItemEvolver error leaves/restores combat automation.', true)
+log('v1.2 reconciliation: startup recovery, manual Recover, and runtime TAC-autoinventory self-heal share one live-state reconciler. Exact tier-derived ID + BaseID + normalized name + tier are required for adoption.', true)
+log('v1.2 ImGui safety: Recover / Re-evaluate is deferred from the ImGui callback to the main loop so TAC status queries, event waits, and mq.delay never execute inside the render callback.', true)
+log('v1.2 persistence: queue entries, order/targets, TAC queue preferences, Compact/Full mode, and separate Full/Compact window position/size are saved per character/server and restored on Lua restart. Persistence is loaded before ImGui starts.', true)
 log('v1.0.1 inherited Legendary cursor recovery: if TAC or another actor auto-inventories the exact expected Legendary before PTItemEvolver can place it, PTItemEvolver searches inventory and accepts exactly one verified Legendary match instead of immediately erroring.', true)
 refresh_inventory()
 load_persistent_state()
