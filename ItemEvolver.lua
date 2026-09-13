@@ -2,7 +2,7 @@ local mq = require('mq')
 local ImGui = require('ImGui')
 
 local SCRIPT_NAME = 'PTItemEvolver'
-local VERSION = 'v1.2'
+local VERSION = 'v1.3'
 local WINDOW_TITLE = string.format('%s %s - Automatic Item Evolver', SCRIPT_NAME, VERSION)
 
 local running = true
@@ -39,7 +39,7 @@ local last_scan_time = 'Never'
 -- Single active item transaction at a time. The ordered queue sits on top of
 -- the proven single-item engine. Inventory/bag and supported worn sources are allowed.
 local move_state = 'IDLE'
-local move_message = 'Select a low-value UPGRADABLE item stored in inventory/bag.'
+local move_message = ''
 local staged_transaction = nil
 local pending_action = nil
 local pending_stage_index = nil
@@ -58,7 +58,55 @@ local active_queue_entry_id = nil
 local queue_advance_pending = false
 local queue_start_tac_when_started = false
 local queue_keep_tac_running_after_complete = false
+local queue_auto_recover_safe_interruptions = false
+
+local COMBAT_CLEAR_DEBOUNCE_SECONDS = 2
+local AUTO_RECOVERY_RETRY_DELAYS = { 0, 2, 5 }
+
+local combat_wait = {
+    active = false,
+    operation = nil,
+    entry_id = nil,
+    clear_since = nil,
+    message = nil,
+}
+
+local auto_recovery = {
+    active = false,
+    class = nil,
+    entry_id = nil,
+    reason = nil,
+    attempt = 0,
+    next_at = nil,
+}
+
 local queue_tac_started_by_ptie = false
+
+local XP_RATE_MAX_SAMPLE_GAP_SECONDS = 300 -- 5 minutes; longer gaps reset the sample baseline without changing the accumulated rate.
+
+local xp_trackers = {
+    Base = {
+        total_xp = 0,
+        total_seconds = 0,
+        baseline_item = nil,
+        baseline_pct = nil,
+        baseline_time = nil,
+        xp_per_hour = nil,
+    },
+    Enchanted = {
+        total_xp = 0,
+        total_seconds = 0,
+        baseline_item = nil,
+        baseline_pct = nil,
+        baseline_time = nil,
+        xp_per_hour = nil,
+    },
+}
+
+-- Per-queue-instance observed progress. This is intentionally session-only.
+-- Future/unseen queue tiers are estimated from 0% until a real chat percentage
+-- is observed for that exact active queue instance/tier.
+local xp_progress_by_instance = {}
 local persistence_recovery_pending = false
 local persistence_ready = false
 
@@ -676,6 +724,11 @@ local finalize_passive_transition
 local reconcile_entry_against_reality
 local recover_queue_state
 local finish_recovered_legendary_from_inventory
+local process_combat_wait
+local process_auto_recovery
+local schedule_combat_wait
+local schedule_auto_recovery
+local auto_restage_transaction_item
 
 local function verified_cursor_owned_transaction_item()
     local tx = staged_transaction
@@ -752,7 +805,86 @@ local function restore_tac_after_error_if_safe(reason)
     return false, state
 end
 
-local function set_move_error(msg)
+local function clear_combat_wait(reason)
+    if combat_wait.active then
+        log(string.format(
+            'COMBAT WAIT CLEARED: operation=%s entry_id=%s reason=%s',
+            tostring(combat_wait.operation), tostring(combat_wait.entry_id), tostring(reason or '<none>')
+        ), true)
+    end
+    combat_wait.active = false
+    combat_wait.operation = nil
+    combat_wait.entry_id = nil
+    combat_wait.clear_since = nil
+    combat_wait.message = nil
+end
+
+schedule_combat_wait = function(operation, entry_id, message)
+    combat_wait.active = true
+    combat_wait.operation = operation
+    combat_wait.entry_id = entry_id
+    combat_wait.clear_since = nil
+    combat_wait.message = message
+    queue_state = 'WAITING_SAFE'
+    queue_message = message or 'Waiting for combat to remain clear before item movement.'
+    move_state = 'WAITING_SAFE'
+    move_message = queue_message
+    log(string.format(
+        'COMBAT WAIT ENTER: operation=%s entry_id=%s debounce=%ss combat=%s cursor={%s} powersource={%s}',
+        tostring(operation), tostring(entry_id), tostring(COMBAT_CLEAR_DEBOUNCE_SECONDS),
+        tostring(in_combat()), item_diag(cursor_item()), item_diag(powersource_item())
+    ), true)
+end
+
+local function clear_auto_recovery(reason)
+    if auto_recovery.active then
+        log(string.format(
+            'AUTO RECOVERY CLEARED: class=%s entry_id=%s attempts=%s reason=%s',
+            tostring(auto_recovery.class), tostring(auto_recovery.entry_id),
+            tostring(auto_recovery.attempt), tostring(reason or '<none>')
+        ), true)
+    end
+    auto_recovery.active = false
+    auto_recovery.class = nil
+    auto_recovery.entry_id = nil
+    auto_recovery.reason = nil
+    auto_recovery.attempt = 0
+    auto_recovery.next_at = nil
+end
+
+schedule_auto_recovery = function(class, entry_id, reason)
+    if not queue_auto_recover_safe_interruptions then return false end
+    if class ~= 'POSSIBLE_TAC_AUTOINVENTORY' then return false end
+    if not entry_id then return false end
+    auto_recovery.active = true
+    auto_recovery.class = class
+    auto_recovery.entry_id = entry_id
+    auto_recovery.reason = reason
+    auto_recovery.attempt = 0
+    auto_recovery.next_at = os.time()
+    log(string.format(
+        'AUTO RECOVERY SCHEDULED: class=%s entry_id=%s attempts=%d delays={0,2,5} reason=%s',
+        tostring(class), tostring(entry_id), #AUTO_RECOVERY_RETRY_DELAYS, tostring(reason or '<none>')
+    ), true)
+    return true
+end
+
+local function resume_tac_after_pre_move_wait(prior_state, reason)
+    if prior_state ~= 'running' then return true end
+    local state = query_tac_state()
+    if state == 'running' then return true end
+    if state ~= 'paused' then return false, state end
+    log(string.format(
+        'PRE-MOVE TAC RESTORE: reason=%s no physical movement began; restoring TAC to its observed pre-validation running state.',
+        tostring(reason or '<none>')
+    ), true)
+    mq.cmd('/ac run')
+    mq.delay(100)
+    state = query_tac_state()
+    return state == 'running', state
+end
+
+local function set_move_error(msg, error_class)
     move_state = 'ERROR'
     move_message = tostring(msg)
     log('PHASE2 ERROR: ' .. move_message, true)
@@ -776,6 +908,14 @@ local function set_move_error(msg)
         -- ERROR is orthogonal to TAC state. Only a verified PTItemEvolver-owned
         -- cursor item justifies keeping TAC paused.
         restore_tac_after_error_if_safe('queue error')
+        if error_class then
+            log(string.format(
+                'QUEUE ERROR CLASSIFIED: class=%s auto_recover_enabled=%s entry_id=%s',
+                tostring(error_class), tostring(queue_auto_recover_safe_interruptions),
+                tostring(active_queue_entry_id)
+            ), true)
+            schedule_auto_recovery(error_class, active_queue_entry_id, move_message)
+        end
     else
         restore_tac_after_error_if_safe('non-queue move error')
     end
@@ -1126,6 +1266,7 @@ save_persistent_state = function(reason)
     f:write('format=1\n')
     f:write('start_tac=', tostring(queue_start_tac_when_started), '\n')
     f:write('keep_tac_running=', tostring(queue_keep_tac_running_after_complete), '\n')
+    f:write('auto_recover_safe_interruptions=', tostring(queue_auto_recover_safe_interruptions), '\n')
     f:write('compact_mode=', tostring(compact_mode), '\n')
     f:write('full_window_x=', tostring(full_window_x or ''), '\n')
     f:write('full_window_y=', tostring(full_window_y or ''), '\n')
@@ -1195,6 +1336,7 @@ local function load_persistent_state()
     local loaded_next_id = 1
     local loaded_start_tac = queue_start_tac_when_started
     local loaded_keep_tac = queue_keep_tac_running_after_complete
+    local loaded_auto_recover = queue_auto_recover_safe_interruptions
     local loaded_compact = compact_mode
     local loaded_full_window_x = nil
     local loaded_full_window_y = nil
@@ -1215,6 +1357,8 @@ local function load_persistent_state()
             loaded_start_tac = persistence_bool(value)
         elseif key == 'keep_tac_running' then
             loaded_keep_tac = persistence_bool(value)
+        elseif key == 'auto_recover_safe_interruptions' then
+            loaded_auto_recover = persistence_bool(value)
         elseif key == 'compact_mode' then
             loaded_compact = persistence_bool(value)
         elseif key == 'full_window_x' then
@@ -1282,6 +1426,7 @@ local function load_persistent_state()
     queue_next_id = loaded_next_id
     queue_start_tac_when_started = loaded_start_tac
     queue_keep_tac_running_after_complete = loaded_keep_tac
+    queue_auto_recover_safe_interruptions = loaded_auto_recover
     compact_mode = loaded_compact
     persistence_recovery_pending = loaded_recovery
 
@@ -1348,10 +1493,11 @@ local function load_persistent_state()
     persistence_ready = true
 
     log(string.format(
-        'PERSIST LOAD: path=%s entries=%d start_tac=%s keep_tac_running=%s compact=%s full_window=(%s,%s %sx%s) compact_window=(%s,%s %sx%s) recovery_pending=%s',
+        'PERSIST LOAD: path=%s entries=%d start_tac=%s keep_tac_running=%s auto_recover=%s compact=%s full_window=(%s,%s %sx%s) compact_window=(%s,%s %sx%s) recovery_pending=%s',
         tostring(path), #queue_entries,
         tostring(queue_start_tac_when_started),
         tostring(queue_keep_tac_running_after_complete),
+        tostring(queue_auto_recover_safe_interruptions),
         tostring(compact_mode),
         tostring(full_window_x), tostring(full_window_y),
         tostring(full_window_width), tostring(full_window_height),
@@ -1367,6 +1513,759 @@ local function queue_entry_by_id(id)
         if entry.id == id then return entry end
     end
     return nil
+end
+
+local function build_pickup_command(source_loc)
+    if not source_loc then return nil end
+    if source_loc.kind == 'BAG' then
+        local pack = tonumber(source_loc.top_slot) - 22
+        return string.format('/itemnotify in pack%d %d leftmouseup', pack, tonumber(source_loc.bag_slot))
+    elseif source_loc.kind == 'TOP' or source_loc.kind == 'WORN' then
+        return string.format('/itemnotify %d leftmouseup', tonumber(source_loc.top_slot))
+    end
+    return nil
+end
+
+local function stage_item_to_powersource_verified(opts)
+    local source_loc = opts and opts.source_loc or nil
+    local selected_snap = opts and opts.selected_snap or nil
+    local original_ps = opts and opts.original_powersource or nil
+    local ps_temp = opts and opts.powersource_temp or nil
+    local context = opts and opts.context or 'stage'
+    local tac_original_state = opts and opts.tac_original_state or 'unknown'
+    local resume_tac = opts and opts.resume_tac == true
+
+    if not source_loc or not selected_snap then
+        return false, 'shared stage called without source location / selected snapshot', 'PREMOVE_FAILED'
+    end
+
+    local pickup_command = build_pickup_command(source_loc)
+    log(string.format(
+        'SHARED STAGE BEGIN: context=%s source=%s expected={%s} source_live={%s} cursor={%s} powersource={%s} combat=%s tac_original=%s command=%s original_ps={%s} ps_temp=%s resume_tac=%s',
+        tostring(context), tostring(source_loc.label), item_diag(selected_snap),
+        item_diag(item_at_location(source_loc)), item_diag(cursor_item()),
+        item_diag(powersource_item()), tostring(in_combat()),
+        tostring(tac_original_state), tostring(pickup_command),
+        item_diag(original_ps), tostring(ps_temp and ps_temp.label or '<none>'),
+        tostring(resume_tac)
+    ), true)
+
+    if not pickup_command then
+        return false, 'Could not build deterministic /itemnotify source command.', 'PREMOVE_FAILED'
+    end
+
+    -- Once this first physical command fires, combat beginning afterward does
+    -- not interrupt the in-flight move; bounded verification remains authoritative.
+    if not notify_location(source_loc) then
+        return false, 'Could not issue deterministic source pickup.', 'MOVEMENT_FAILED'
+    end
+    log(string.format('SHARED STAGE PICKUP ISSUED: context=%s command=%s', tostring(context), tostring(pickup_command)), true)
+
+    local pickup_verify_attempt = 0
+    local pickup_verified = wait_for(function()
+        pickup_verify_attempt = pickup_verify_attempt + 1
+        local live_source = item_at_location(source_loc)
+        local live_cursor = cursor_item()
+        local cursor_match = exact_item_match(live_cursor, selected_snap)
+        local source_empty = live_source == nil
+        log(string.format(
+            'SHARED STAGE PICKUP VERIFY: context=%s attempt=%d cursor_match=%s source_empty=%s source_live={%s} cursor={%s} powersource={%s}',
+            tostring(context), pickup_verify_attempt, tostring(cursor_match), tostring(source_empty),
+            item_diag(live_source), item_diag(live_cursor), item_diag(powersource_item())
+        ), true)
+        return cursor_match and source_empty
+    end)
+
+    if not pickup_verified then
+        log(string.format(
+            'SHARED STAGE PICKUP FAILURE: context=%s attempts=%d expected={%s} source_live={%s} cursor={%s} powersource={%s} combat=%s',
+            tostring(context), pickup_verify_attempt, item_diag(selected_snap),
+            item_diag(item_at_location(source_loc)), item_diag(cursor_item()),
+            item_diag(powersource_item()), tostring(in_combat())
+        ), true)
+        return false, 'Selected item pickup did not verify.', 'MOVEMENT_FAILED'
+    end
+
+    log(string.format(
+        'SHARED STAGE PICKUP VERIFIED: context=%s attempt=%d source_live={%s} cursor={%s}',
+        tostring(context), pickup_verify_attempt,
+        item_diag(item_at_location(source_loc)), item_diag(cursor_item())
+    ), true)
+
+    move_message = 'Placing selected item in power-source slot...'
+    mq.cmd('/itemnotify powersource leftmouseup')
+    if not wait_for(function()
+        if not exact_item_match(powersource_item(), selected_snap) then return false end
+        if original_ps then return exact_item_match(cursor_item(), original_ps) end
+        return cursor_is_empty()
+    end) then
+        return false, 'Power-source placement did not verify.', 'MOVEMENT_FAILED'
+    end
+
+    if original_ps then
+        move_message = string.format(
+            'Parking original power-source item in %s...',
+            tostring(ps_temp and ps_temp.label or '<unknown>')
+        )
+        if not ps_temp or not notify_location(ps_temp) then
+            return false, 'Could not address the reserved temporary power-source location.', 'MOVEMENT_FAILED'
+        end
+        if not wait_for(function()
+            return cursor_is_empty() and exact_item_match(item_at_location(ps_temp), original_ps)
+        end) then
+            return false, 'Could not verify original power-source item in reserved temporary storage.', 'MOVEMENT_FAILED'
+        end
+    end
+
+    if not exact_item_match(powersource_item(), selected_snap) then
+        return false, 'Final stage verification failed: selected item is not exactly verified in power-source.', 'MOVEMENT_FAILED'
+    end
+    if original_ps and not exact_item_match(item_at_location(ps_temp), original_ps) then
+        return false, 'Final stage verification failed: original power-source item is not exactly verified in reserved temporary storage.', 'MOVEMENT_FAILED'
+    end
+    if item_at_location(source_loc) ~= nil then
+        return false, 'Final stage verification failed: selected item source location should be empty.', 'MOVEMENT_FAILED'
+    end
+    if not cursor_is_empty() then
+        return false, 'Final stage verification failed: cursor is not empty.', 'MOVEMENT_FAILED'
+    end
+
+    local tac_resumed = false
+    if resume_tac then
+        local state = query_tac_state()
+        if state == 'paused' then
+            log(string.format('SHARED STAGE TAC RESUME: context=%s issuing /ac run after verified stage.', tostring(context)), true)
+            mq.cmd('/ac run')
+            mq.delay(100)
+            state = query_tac_state()
+        end
+        if state ~= 'running' then
+            return false, string.format(
+                'Item staged safely, but TAC resume for monitoring failed (status=%s).',
+                tostring(state)
+            ), 'POSTMOVE_TAC_FAILED'
+        end
+        tac_resumed = true
+    end
+
+    log(string.format(
+        'SHARED STAGE SUCCESS: context=%s source=%s tac_resumed=%s combat_now=%s',
+        tostring(context), tostring(source_loc.label), tostring(tac_resumed), tostring(in_combat())
+    ), true)
+    return true, nil, nil, tac_resumed
+end
+
+local function auto_recovery_exact_inventory_index(entry)
+    if not entry then return nil, 'missing queue entry' end
+    return queue_resolve_inventory_index(entry)
+end
+
+auto_restage_transaction_item = function(entry, idx, reason)
+    local tx = staged_transaction
+    local rec = idx and items[idx] or nil
+    if not entry or not tx or not rec then
+        return false, 'missing live transaction or exact inventory candidate', true
+    end
+
+    local source_loc = snapshot_rec_location(rec)
+    local selected_snap = snapshot_item(item_at_location(source_loc))
+    if not selected_snap or selected_snap.id ~= rec.id or selected_snap.name ~= rec.name then
+        return false, 'exact recovery candidate changed before restage', false
+    end
+    if not cursor_is_empty() then
+        return false, 'cursor is occupied; automatic recovery will not guess ownership', true
+    end
+
+    local ps = powersource_item()
+    if ps ~= nil then
+        if exact_item_match(ps, tx.selected) then
+            local reconciled, detail = reconcile_entry_against_reality(entry, 'auto recovery found exact item already in powersource')
+            return reconciled, detail or 'powersource adoption', not reconciled
+        end
+        return false, 'powersource is occupied by an unexpected item', true
+    end
+
+    if tx.original_powersource then
+        local parked = tx.powersource_temp or tx.source
+        if not exact_item_match(item_at_location(parked), tx.original_powersource) then
+            return false, 'original powersource is not exactly verified in reserved temporary storage', true
+        end
+    end
+
+    local tac_before = {}
+    local tac_ok, tac_err = require_tac_paused(tac_before)
+    if not tac_ok then
+        return false, 'TAC could not be paused before automatic restage: ' .. tostring(tac_err), true
+    end
+
+    -- FINAL COMBAT GATE: observation can finish in combat, but the first physical
+    -- move cannot start in combat. If combat appeared, no movement has begun.
+    if in_combat() then
+        local resumed, resume_state = resume_tac_after_pre_move_wait(
+            tac_before.state,
+            'combat appeared during automatic recovery revalidation'
+        )
+        if not resumed then
+            return false, string.format(
+                'combat appeared before restage and TAC could not be restored to prior running state (status=%s)',
+                tostring(resume_state)
+            ), true
+        end
+        schedule_combat_wait(
+            'AUTO_RECOVERY_RESTAGE',
+            entry.id,
+            'Automatic recovery found the exact item, but combat is active. Waiting for 2 seconds continuously clear before revalidating and restaging.'
+        )
+        return false, 'waiting for combat clear', false, 'WAITING_COMBAT'
+    end
+
+    if not cursor_is_empty() then
+        return false, 'cursor became occupied during automatic recovery revalidation', true
+    end
+    if powersource_item() ~= nil then
+        return false, 'powersource changed during automatic recovery revalidation', true
+    end
+    if not exact_item_match(item_at_location(source_loc), selected_snap) then
+        return false, 'recovery source item changed during final revalidation', true
+    end
+    if tx.original_powersource then
+        local parked = tx.powersource_temp or tx.source
+        if not exact_item_match(item_at_location(parked), tx.original_powersource) then
+            return false, 'parked original powersource changed during final revalidation', true
+        end
+    end
+
+    local should_run = queue_tac_started_by_ptie
+        or tx.tac_original_state == 'running'
+        or tac_before.state == 'running'
+
+    local moved, move_err, move_outcome, tac_resumed = stage_item_to_powersource_verified({
+        source_loc = source_loc,
+        selected_snap = selected_snap,
+        original_powersource = nil, -- recovery already verified any original PS is parked
+        powersource_temp = nil,
+        context = 'AUTO_RECOVERY_RESTAGE',
+        tac_original_state = tac_before.state,
+        resume_tac = should_run,
+    })
+    if not moved then
+        return false, tostring(move_err), true, move_outcome or 'MOVEMENT_FAILED'
+    end
+
+    tx.selected = selected_snap
+    tx.current = selected_snap
+    tx.tac_resumed_for_monitor = tac_resumed == true
+    entry.status = 'ACTIVE'
+    entry.message = 'Automatic recovery restaged the exact transaction item and resumed monitoring.'
+    active_queue_entry_id = entry.id
+    queue_running = true
+    queue_advance_pending = false
+    queue_state = 'RUNNING'
+    queue_message = string.format(
+        'Monitoring %s -> %s.',
+        tostring(entry.display_name), tostring(entry.target_tier)
+    )
+    move_state = 'MONITORING_PROGRESS'
+    move_message = entry.message
+    persistence_recovery_pending = false
+
+    log(string.format(
+        'AUTO RECOVERY SUCCESS: result=RESTAGED_AND_MONITORING queue_id=%s source=%s TAC_should_run=%s tac_resumed=%s combat_now=%s',
+        tostring(entry.id), tostring(source_loc.label), tostring(should_run),
+        tostring(tx.tac_resumed_for_monitor), tostring(in_combat())
+    ), true)
+    save_persistent_state('automatic recovery restaged active transaction')
+    return true, 'restaged and monitoring', false
+end
+
+process_auto_recovery = function()
+    if not auto_recovery.active or combat_wait.active then return end
+    if os.time() < (auto_recovery.next_at or 0) then return end
+
+    local entry = queue_entry_by_id(auto_recovery.entry_id)
+    if not entry then
+        clear_auto_recovery('queue entry missing')
+        return
+    end
+    local tx = staged_transaction
+    auto_recovery.attempt = auto_recovery.attempt + 1
+
+    log(string.format(
+        'AUTO RECOVERY ATTEMPT %d/%d: class=%s queue_id=%s item=%s cursor={%s} powersource={%s}',
+        auto_recovery.attempt, #AUTO_RECOVERY_RETRY_DELAYS,
+        tostring(auto_recovery.class), tostring(entry.id), tostring(entry.display_name),
+        item_diag(cursor_item()), item_diag(powersource_item())
+    ), true)
+
+    if tx and exact_item_match(powersource_item(), tx.selected) then
+        local ok, detail = reconcile_entry_against_reality(entry, 'automatic recovery active-powersource check')
+        if ok then
+            clear_auto_recovery('exact active item already in powersource')
+            return
+        end
+        log('AUTO RECOVERY OBSERVATION: exact powersource reconciliation failed: ' .. tostring(detail), true)
+    end
+
+    if tx and tx.target_tier == 'Legendary' then
+        local recovered, recovered_loc = recover_legendary_from_inventory(
+            tx,
+            'automatic recovery expected-Legendary inventory check'
+        )
+        if recovered then
+            local ok = finish_recovered_legendary_from_inventory(
+                tx, recovered_loc, 'automatic recovery TAC autoinventory'
+            )
+            if ok ~= false then
+                clear_auto_recovery('exact Legendary recovered from inventory')
+                return
+            end
+            clear_auto_recovery('Legendary recovery finalization failed')
+            return
+        end
+    end
+
+    local idx, resolve_err = auto_recovery_exact_inventory_index(entry)
+    if idx then
+        local ok, detail, fatal, outcome = auto_restage_transaction_item(
+            entry, idx, 'automatic recovery exact inventory restage'
+        )
+        if ok then
+            clear_auto_recovery(detail)
+            return
+        end
+        if outcome == 'WAITING_COMBAT' then return end
+        if outcome == 'MOVEMENT_FAILED' or fatal then
+            clear_auto_recovery('automatic restage failed safely')
+            return set_move_error('Automatic recovery stopped: ' .. tostring(detail))
+        end
+        log('AUTO RECOVERY OBSERVATION UNRESOLVED: ' .. tostring(detail), true)
+    else
+        log(string.format(
+            'AUTO RECOVERY OBSERVATION UNRESOLVED: exact pre-target inventory item not yet available. resolver=%s',
+            tostring(resolve_err or '<none>')
+        ), true)
+    end
+
+    if auto_recovery.attempt >= #AUTO_RECOVERY_RETRY_DELAYS then
+        local attempts = auto_recovery.attempt
+        clear_auto_recovery('retry budget exhausted')
+        queue_state = 'ERROR'
+        move_state = 'ERROR'
+        queue_running = false
+        queue_message = string.format(
+            'Automatic recovery could not safely reconcile the transaction after %d observation attempts. Manual intervention required.',
+            attempts
+        )
+        move_message = queue_message
+        entry.status = 'ERROR'
+        entry.message = queue_message
+        log('AUTO RECOVERY EXHAUSTED: ' .. queue_message, true)
+        return
+    end
+
+    local delay = AUTO_RECOVERY_RETRY_DELAYS[auto_recovery.attempt + 1] or 5
+    auto_recovery.next_at = os.time() + delay
+    log(string.format(
+        'AUTO RECOVERY RETRY SCHEDULED: next_attempt=%d/%d delay=%ss',
+        auto_recovery.attempt + 1, #AUTO_RECOVERY_RETRY_DELAYS, tostring(delay)
+    ), true)
+end
+
+process_combat_wait = function()
+    if not combat_wait.active then return end
+
+    if in_combat() then
+        if combat_wait.clear_since then
+            log(string.format(
+                'COMBAT CLEAR CANDIDATE RESET: operation=%s entry_id=%s combat=true after=%ss',
+                tostring(combat_wait.operation), tostring(combat_wait.entry_id),
+                tostring(os.time() - combat_wait.clear_since)
+            ), true)
+        end
+        combat_wait.clear_since = nil
+        return
+    end
+
+    if not combat_wait.clear_since then
+        combat_wait.clear_since = os.time()
+        log(string.format(
+            'COMBAT CLEAR CANDIDATE STARTED: operation=%s entry_id=%s required=%ss',
+            tostring(combat_wait.operation), tostring(combat_wait.entry_id),
+            tostring(COMBAT_CLEAR_DEBOUNCE_SECONDS)
+        ), true)
+        return
+    end
+
+    local clear_for = os.time() - combat_wait.clear_since
+    if clear_for < COMBAT_CLEAR_DEBOUNCE_SECONDS then return end
+
+    local operation = combat_wait.operation
+    local entry_id = combat_wait.entry_id
+    log(string.format(
+        'COMBAT CLEAR CONFIRMED: operation=%s entry_id=%s continuously_clear=%ss; stale pre-move observations discarded.',
+        tostring(operation), tostring(entry_id), tostring(clear_for)
+    ), true)
+    clear_combat_wait('debounce satisfied')
+
+    if operation == 'STAGE_NEXT_QUEUE_ITEM' then
+        queue_running = true
+        queue_advance_pending = true
+        queue_state = 'RUNNING'
+        queue_message = 'Combat clear confirmed. Revalidating the next queue item before staging.'
+        move_state = 'IDLE'
+        move_message = queue_message
+        return
+    end
+
+    if operation == 'AUTO_RECOVERY_RESTAGE' then
+        auto_recovery.active = true
+        auto_recovery.entry_id = entry_id
+        auto_recovery.next_at = os.time()
+        queue_state = 'ERROR'
+        move_state = 'ERROR'
+        queue_message = 'Combat clear confirmed. Re-running automatic recovery from live state.'
+        move_message = queue_message
+        return
+    end
+
+    if operation == 'ENCHANTED_RESTORE' then
+        local tx = staged_transaction
+        if tx then
+            tx.waiting_safe_reason = 'EnchantedRestore'
+            move_state = 'TARGET_REACHED'
+            return restore_staged_item()
+        end
+    end
+end
+
+local function clamp_pct(value)
+    local n = tonumber(value)
+    if not n then return nil end
+    if n < 0 then return 0 end
+    if n > 100 then return 100 end
+    return n
+end
+
+local function xp_tier_from_item_name(item_name)
+    local _, suffix_tier = normalize_tier_name(item_name or '')
+    if suffix_tier == 'Enchanted' then return 'Enchanted' end
+    if suffix_tier == 'Legendary' then return 'Legendary' end
+    return 'Base'
+end
+
+local function xp_instance_progress(entry, tier)
+    if not entry or not entry.instance_key then return nil end
+    local by_tier = xp_progress_by_instance[entry.instance_key]
+    if not by_tier then return nil end
+    return clamp_pct(by_tier[tier])
+end
+
+local function xp_set_instance_progress(entry, tier, pct, reason)
+    if not entry or not entry.instance_key then return end
+    if tier ~= 'Base' and tier ~= 'Enchanted' then return end
+    pct = clamp_pct(pct)
+    if not pct then return end
+
+    local by_tier = xp_progress_by_instance[entry.instance_key]
+    if not by_tier then
+        by_tier = {}
+        xp_progress_by_instance[entry.instance_key] = by_tier
+    end
+
+    by_tier[tier] = pct
+    log(string.format(
+        'XP PROGRESS OBSERVED: queue_id=%s instance=%s item=%s tier=%s pct=%.2f reason=%s',
+        tostring(entry.id), tostring(entry.instance_key), tostring(entry.display_name),
+        tostring(tier), pct, tostring(reason or '<none>')
+    ))
+end
+
+local function xp_mark_tier_complete(entry, tier, reason)
+    xp_set_instance_progress(entry, tier, 100, reason or 'tier completed')
+end
+
+local function xp_rate_for_tier(tier)
+    local tracker = xp_trackers[tier]
+    if not tracker then return nil end
+    return tracker.xp_per_hour
+end
+
+local function xp_reset_rate_baseline(tracker, item_name, pct, now)
+    tracker.baseline_item = item_name
+    tracker.baseline_pct = pct
+    tracker.baseline_time = now
+end
+
+local function xp_record_rate_sample(tier, item_name, pct, now)
+    local tracker = xp_trackers[tier]
+    if not tracker then return 'ignored unsupported tier' end
+
+    if not tracker.baseline_item then
+        xp_reset_rate_baseline(tracker, item_name, pct, now)
+        return 'baseline'
+    end
+
+    if item_name ~= tracker.baseline_item then
+        xp_reset_rate_baseline(tracker, item_name, pct, now)
+        return 'new item baseline'
+    end
+
+    if pct < tracker.baseline_pct then
+        xp_reset_rate_baseline(tracker, item_name, pct, now)
+        return 'lower percentage baseline'
+    end
+
+    local elapsed = now - (tracker.baseline_time or now)
+    local gained = pct - tracker.baseline_pct
+
+    -- os.time() has one-second resolution. If multiple XP messages land in the
+    -- same second, do not credit XP with zero time cost. Keep the old baseline
+    -- so the accumulated gain is folded into the next positive-elapsed sample.
+    if elapsed <= 0 then
+        return string.format(
+            'same-second sample deferred gain=%.2f elapsed=%ss baseline_pct=%.2f current_pct=%.2f',
+            gained, tostring(elapsed), tracker.baseline_pct, pct
+        )
+    end
+
+    -- Long inactivity / zoning / AFK gaps should not dilute the farming rate.
+    -- Treat the first post-gap message as a fresh baseline while preserving the
+    -- already accumulated rate history.
+    if elapsed > XP_RATE_MAX_SAMPLE_GAP_SECONDS then
+        xp_reset_rate_baseline(tracker, item_name, pct, now)
+        return string.format(
+            'long-gap baseline reset elapsed=%ss ceiling=%ss pct=%.2f',
+            tostring(elapsed), tostring(XP_RATE_MAX_SAMPLE_GAP_SECONDS), pct
+        )
+    end
+
+    tracker.total_xp = tracker.total_xp + gained
+    tracker.total_seconds = tracker.total_seconds + elapsed
+    tracker.baseline_pct = pct
+    tracker.baseline_time = now
+
+    if tracker.total_seconds > 0 then
+        tracker.xp_per_hour = tracker.total_xp * 3600 / tracker.total_seconds
+    end
+
+    return string.format(
+        'sample gain=%.2f elapsed=%ss total_xp=%.2f total_seconds=%s rate=%s',
+        gained,
+        tostring(elapsed),
+        tracker.total_xp,
+        tostring(tracker.total_seconds),
+        tracker.xp_per_hour and string.format('%.2f', tracker.xp_per_hour) or '<pending>'
+    )
+end
+
+local function xp_event_matches_active_queue_item(item_name, tier)
+    if not active_queue_entry_id then return nil, 'no active queue entry' end
+
+    local entry = queue_entry_by_id(active_queue_entry_id)
+    if not entry then return nil, 'active queue entry missing' end
+
+    local ps = snapshot_tier(powersource_item())
+    if not ps then return nil, 'powersource empty' end
+
+    local event_base_name = normalize_tier_name(item_name)
+    if ps.normalized_base_name ~= event_base_name then
+        return nil, 'event item does not match powersource base name'
+    end
+    if ps.detected_tier ~= tier then
+        return nil, 'event tier does not match powersource tier'
+    end
+    if ps.normalized_base_name ~= entry.normalized_base_name
+        or ps.normalized_base_id ~= entry.normalized_base_id then
+        return nil, 'powersource does not match active queue identity'
+    end
+
+    return entry, 'exact active queue powersource match'
+end
+
+local function item_xp_event(line, item_name, pct_text)
+    local pct = tonumber(pct_text)
+    if not item_name or not pct then
+        log(string.format(
+            'XP EVENT PARSE FAILED: line=%s item=%s pct=%s',
+            tostring(line), tostring(item_name), tostring(pct_text)
+        ), true)
+        return
+    end
+
+    local tier = xp_tier_from_item_name(item_name)
+    if tier == 'Legendary' then
+        log(string.format(
+            'XP EVENT IGNORED: Legendary item should not contribute evolution rate item=%s pct=%.2f',
+            tostring(item_name), pct
+        ))
+        return
+    end
+
+    local now = os.time()
+    local rate_result = xp_record_rate_sample(tier, item_name, pct, now)
+
+    local entry, attribution = xp_event_matches_active_queue_item(item_name, tier)
+    if entry then
+        xp_set_instance_progress(entry, tier, pct, 'live item XP chat event')
+    end
+
+    local tracker = xp_trackers[tier]
+    log(string.format(
+        'XP EVENT: item=%s tier=%s pct=%.2f rate_result={%s} xp_per_hour=%s queue_attribution=%s',
+        tostring(item_name), tostring(tier), pct, tostring(rate_result),
+        tracker and tracker.xp_per_hour and string.format('%.2f', tracker.xp_per_hour) or '<pending>',
+        tostring(attribution)
+    ), true)
+end
+
+local function queue_eta_snapshot()
+    local snapshot = {
+        base_remaining = 0,
+        enchanted_remaining = 0,
+        base_observed = 0,
+        base_assumed = 0,
+        enchanted_observed = 0,
+        enchanted_assumed = 0,
+        invalid_segments = 0,
+    }
+
+    local tier_by_instance = {}
+
+    local function add_segment(entry, tier)
+        local pct = xp_instance_progress(entry, tier)
+        local observed = pct ~= nil
+        pct = pct or 0
+        local remaining = math.max(0, 100 - pct)
+
+        if tier == 'Base' then
+            snapshot.base_remaining = snapshot.base_remaining + remaining
+            if observed then
+                snapshot.base_observed = snapshot.base_observed + 1
+            else
+                snapshot.base_assumed = snapshot.base_assumed + 1
+            end
+        elseif tier == 'Enchanted' then
+            snapshot.enchanted_remaining = snapshot.enchanted_remaining + remaining
+            if observed then
+                snapshot.enchanted_observed = snapshot.enchanted_observed + 1
+            else
+                snapshot.enchanted_assumed = snapshot.enchanted_assumed + 1
+            end
+        end
+    end
+
+    for _, entry in ipairs(queue_entries) do
+        if entry.status == 'ACTIVE' or entry.status == 'QUEUED' or entry.status == 'ERROR' then
+            local effective_tier = tier_by_instance[entry.instance_key] or entry.starting_tier
+
+            if entry.id == active_queue_entry_id
+                and staged_transaction
+                and staged_transaction.queue_entry_id == entry.id
+                and (staged_transaction.start_tier == 'Base' or staged_transaction.start_tier == 'Enchanted') then
+                effective_tier = staged_transaction.start_tier
+            end
+
+            if entry.target_tier == 'Enchanted' and effective_tier == 'Base' then
+                add_segment(entry, 'Base')
+                tier_by_instance[entry.instance_key] = 'Enchanted'
+            elseif entry.target_tier == 'Legendary' and effective_tier == 'Base' then
+                add_segment(entry, 'Base')
+                add_segment(entry, 'Enchanted')
+                tier_by_instance[entry.instance_key] = 'Legendary'
+            elseif entry.target_tier == 'Legendary' and effective_tier == 'Enchanted' then
+                add_segment(entry, 'Enchanted')
+                tier_by_instance[entry.instance_key] = 'Legendary'
+            else
+                snapshot.invalid_segments = snapshot.invalid_segments + 1
+                tier_by_instance[entry.instance_key] = entry.target_tier or effective_tier
+            end
+        end
+    end
+
+    local base_rate = xp_rate_for_tier('Base')
+    local enchanted_rate = xp_rate_for_tier('Enchanted')
+    local missing = {}
+    local eta_hours = 0
+
+    if snapshot.base_remaining > 0 then
+        if base_rate and base_rate > 0 then
+            eta_hours = eta_hours + snapshot.base_remaining / base_rate
+        else
+            missing[#missing + 1] = 'Base'
+        end
+    end
+
+    if snapshot.enchanted_remaining > 0 then
+        if enchanted_rate and enchanted_rate > 0 then
+            eta_hours = eta_hours + snapshot.enchanted_remaining / enchanted_rate
+        else
+            missing[#missing + 1] = 'Enchanted'
+        end
+    end
+
+    snapshot.base_rate = base_rate
+    snapshot.enchanted_rate = enchanted_rate
+    snapshot.missing_rates = missing
+    snapshot.eta_hours = #missing == 0 and eta_hours or nil
+    return snapshot
+end
+
+local function format_xp_rate(rate)
+    if rate and rate > 0 then
+        return string.format('%.2f%%/h', rate)
+    end
+    return '--.--%/h'
+end
+
+local function format_eta_hours(hours)
+    if not hours then return nil end
+    local total_minutes = math.max(0, math.floor(hours * 60 + 0.5))
+    local days = math.floor(total_minutes / 1440)
+    local rem = total_minutes % 1440
+    local hrs = math.floor(rem / 60)
+    local mins = rem % 60
+
+    if days > 0 then
+        return string.format('%dd %dh %dm', days, hrs, mins)
+    end
+    if hrs > 0 then
+        return string.format('%dh %dm', hrs, mins)
+    end
+    return string.format('%dm', mins)
+end
+
+local function queue_eta_text()
+    local s = queue_eta_snapshot()
+    if s.base_remaining <= 0 and s.enchanted_remaining <= 0 then
+        return 'Queue ETA: complete / no remaining evolution work', s
+    end
+
+    if s.eta_hours then
+        return string.format('Queue ETA: %s', format_eta_hours(s.eta_hours)), s
+    end
+
+    return string.format(
+        'Queue ETA: waiting for %s XP/hour rate',
+        table.concat(s.missing_rates, ' + ')
+    ), s
+end
+
+function draw_xp_eta_summary()
+    local eta_text, s = queue_eta_text()
+    ImGui.Text(string.format(
+        'XP/hr: Base %s   |   Enchanted %s',
+        format_xp_rate(s.base_rate),
+        format_xp_rate(s.enchanted_rate)
+    ))
+    ImGui.Text(eta_text)
+
+    if ImGui.IsItemHovered() then
+        ImGui.SetTooltip(string.format(
+            'Remaining XP: Base %.2f%% (observed %d / assumed %d) | Enchanted %.2f%% (observed %d / assumed %d)',
+            s.base_remaining, s.base_observed, s.base_assumed,
+            s.enchanted_remaining, s.enchanted_observed, s.enchanted_assumed
+        ))
+    end
 end
 
 local function same_record_location(rec, loc)
@@ -1793,6 +2692,10 @@ reconcile_entry_against_reality = function(entry, reason)
             queue_running = true
             queue_advance_pending = false
             queue_state = 'RUNNING'
+            queue_message = string.format(
+                'Monitoring %s -> %s.',
+                tostring(entry.display_name), tostring(entry.target_tier)
+            )
             move_state = 'MONITORING_PROGRESS'
             move_message = entry.message
             persistence_recovery_pending = false
@@ -1850,6 +2753,10 @@ reconcile_entry_against_reality = function(entry, reason)
             queue_running = true
             queue_advance_pending = false
             queue_state = 'RUNNING'
+            queue_message = string.format(
+                'Monitoring %s -> %s.',
+                tostring(entry.display_name), tostring(entry.target_tier)
+            )
             move_state = 'MONITORING_PROGRESS'
             move_message = string.format(
                 '%s was already in powersource at %s; adopted and monitoring toward %s.',
@@ -2433,6 +3340,13 @@ complete_active_queue_entry = function(tx, final_location, final_tier)
         return true
     end
 
+    if final_tier == 'Enchanted' then
+        xp_mark_tier_complete(entry, 'Base', 'queue entry verified Enchanted')
+    elseif final_tier == 'Legendary' then
+        xp_mark_tier_complete(entry, 'Base', 'queue entry verified Legendary')
+        xp_mark_tier_complete(entry, 'Enchanted', 'queue entry verified Legendary')
+    end
+
     local old_location = clone_location(entry.current_location)
     entry.current_location = clone_location(final_location)
     entry.status = 'COMPLETE'
@@ -2544,9 +3458,19 @@ local function process_queue_engine()
         return
     end
 
+    if combat_wait.active then return end
+
     if in_combat() then
-        queue_state = 'WAITING_SAFE'
-        queue_message = 'Waiting for combat to end before starting the next queue item.'
+        if queue_auto_recover_safe_interruptions then
+            schedule_combat_wait(
+                'STAGE_NEXT_QUEUE_ITEM',
+                nil,
+                'Combat is blocking the next item movement. Waiting for 2 seconds continuously clear before revalidating.'
+            )
+        else
+            queue_state = 'WAITING_SAFE'
+            queue_message = 'Waiting for combat to end before starting the next queue item.'
+        end
         return
     end
     if not cursor_is_empty() then
@@ -2731,7 +3655,24 @@ stage_selected_item = function(index, passive_monitor, requested_final_target_ti
     elseif tonumber(rec.top_slot or -1) < 23 or tonumber(rec.top_slot or -1) > 32 then
         return set_move_error('Selected inventory source is not a normal pack location.')
     end
-    if in_combat() then return set_move_error('Cannot start item movement while in combat.') end
+    if in_combat() then
+        if queue_auto_recover_safe_interruptions and active_queue_entry_id then
+            local entry = queue_entry_by_id(active_queue_entry_id)
+            if entry then
+                entry.status = 'QUEUED'
+                entry.message = 'Waiting for combat to remain clear before staging.'
+            end
+            active_queue_entry_id = nil
+            queue_advance_pending = true
+            schedule_combat_wait(
+                'STAGE_NEXT_QUEUE_ITEM',
+                entry and entry.id or nil,
+                'Combat is blocking item staging. Waiting for 2 seconds continuously clear before revalidating.'
+            )
+            return false
+        end
+        return set_move_error('Cannot start item movement while in combat.')
+    end
     if not cursor_is_empty() then return set_move_error('Cursor must be empty before PTItemEvolver moves any item.') end
 
     local source_loc = snapshot_rec_location(rec)
@@ -2771,7 +3712,34 @@ stage_selected_item = function(index, passive_monitor, requested_final_target_ti
     if not tac_ok then return set_move_error(tac_err .. ' No item movement was attempted.') end
 
     -- Revalidate after TAC is confirmed paused. Nothing has moved yet.
-    if in_combat() then return set_move_error('Combat began during validation. TAC remains paused; no item movement was attempted.') end
+    if in_combat() then
+        if queue_auto_recover_safe_interruptions and active_queue_entry_id then
+            local entry = queue_entry_by_id(active_queue_entry_id)
+            local resume_ok, resume_state = resume_tac_after_pre_move_wait(
+                tac_original.state,
+                'combat began during queue staging validation'
+            )
+            if not resume_ok then
+                return set_move_error(string.format(
+                    'Combat began during validation and TAC could not be restored to its prior running state (status=%s). No item movement was attempted.',
+                    tostring(resume_state)
+                ))
+            end
+            if entry then
+                entry.status = 'QUEUED'
+                entry.message = 'Combat began during validation; no item movement occurred. Waiting to retry.'
+            end
+            active_queue_entry_id = nil
+            queue_advance_pending = true
+            schedule_combat_wait(
+                'STAGE_NEXT_QUEUE_ITEM',
+                entry and entry.id or nil,
+                'Combat began during pre-move validation. No item movement occurred; waiting for 2 seconds continuously clear before revalidating from scratch.'
+            )
+            return false
+        end
+        return set_move_error('Combat began during validation. TAC remains paused; no item movement was attempted.')
+    end
     if not cursor_is_empty() then return set_move_error('Cursor became occupied during validation. TAC remains paused; no item movement was attempted.') end
     if not exact_item_match(item_at_location(source_loc), selected_snap) then
         return set_move_error('Source item changed during validation. TAC remains paused; no item movement was attempted.')
@@ -2815,118 +3783,33 @@ stage_selected_item = function(index, passive_monitor, requested_final_target_ti
     move_state = 'EQUIPPING'
     move_message = 'Picking up selected item...'
 
-    local pickup_command = nil
-    if source_loc.kind == 'BAG' then
-        local pack = tonumber(source_loc.top_slot) - 22
-        pickup_command = string.format('/itemnotify in pack%d %d leftmouseup', pack, tonumber(source_loc.bag_slot))
-    elseif source_loc.kind == 'TOP' or source_loc.kind == 'WORN' then
-        pickup_command = string.format('/itemnotify %d leftmouseup', tonumber(source_loc.top_slot))
-    end
+    local shared_resume_tac = passive_monitor and staged_transaction.tac_original_state == 'running'
+    local moved, move_err, move_outcome, tac_resumed = stage_item_to_powersource_verified({
+        source_loc = source_loc,
+        selected_snap = selected_snap,
+        original_powersource = ps_snap,
+        powersource_temp = staged_transaction.powersource_temp,
+        context = 'NORMAL_QUEUE_STAGE',
+        tac_original_state = staged_transaction.tac_original_state,
+        resume_tac = shared_resume_tac,
+    })
 
-    log(string.format(
-        'PICKUP DIAGNOSTIC BEFORE: source=%s expected={%s} source_live={%s} cursor={%s} powersource={%s} combat=%s tac_original=%s command=%s',
-        tostring(source_loc.label),
-        item_diag(source_now),
-        item_diag(item_at_location(source_loc)),
-        item_diag(cursor_item()),
-        item_diag(powersource_item()),
-        tostring(in_combat()),
-        tostring(staged_transaction.tac_original_state),
-        tostring(pickup_command)
-    ), true)
-
-    if not pickup_command then
-        return set_move_error('Could not build deterministic /itemnotify source command.')
-    end
-
-    -- Intentionally keep the existing movement behavior: one notify_location() call.
-    -- v0.2.2 only adds diagnostics around it.
-    if not notify_location(source_loc) then
-        return set_move_error('Could not build deterministic /itemnotify source command.')
-    end
-    log('PICKUP DIAGNOSTIC COMMAND ISSUED: ' .. pickup_command, true)
-
-    local pickup_verify_attempt = 0
-    local pickup_verified = wait_for(function()
-        pickup_verify_attempt = pickup_verify_attempt + 1
-        local live_source = item_at_location(source_loc)
-        local live_cursor = cursor_item()
-        local cursor_match = exact_item_match(live_cursor, selected_snap)
-        local source_empty = live_source == nil
-        log(string.format(
-            'PICKUP VERIFY attempt=%d cursor_match=%s source_empty=%s source_live={%s} cursor={%s} powersource={%s}',
-            pickup_verify_attempt,
-            tostring(cursor_match),
-            tostring(source_empty),
-            item_diag(live_source),
-            item_diag(live_cursor),
-            item_diag(powersource_item())
-        ), true)
-        return cursor_match and source_empty
-    end)
-
-    if not pickup_verified then
-        log(string.format(
-            'PICKUP DIAGNOSTIC FAILURE FINAL: attempts=%d expected={%s} source_live={%s} cursor={%s} powersource={%s} combat=%s',
-            pickup_verify_attempt,
-            item_diag(source_now),
-            item_diag(item_at_location(source_loc)),
-            item_diag(cursor_item()),
-            item_diag(powersource_item()),
-            tostring(in_combat())
-        ), true)
-        return set_move_error('Selected item pickup did not verify. TAC remains paused; do not resume TAC until cursor/location is inspected.')
-    end
-
-    log(string.format(
-        'PICKUP DIAGNOSTIC SUCCESS: attempt=%d source_live={%s} cursor={%s}',
-        pickup_verify_attempt,
-        item_diag(item_at_location(source_loc)),
-        item_diag(cursor_item())
-    ), true)
-
-    move_message = 'Placing selected item in power-source slot...'
-    mq.cmd('/itemnotify powersource leftmouseup')
-    if not wait_for(function()
-        if not exact_item_match(powersource_item(), selected_snap) then return false end
-        if ps_snap then return exact_item_match(cursor_item(), ps_snap) end
-        return cursor_is_empty()
-    end) then
-        return set_move_error('Power-source placement did not verify. TAC remains paused; inspect cursor and power-source manually.')
-    end
-
-    if ps_snap then
-        local ps_temp = staged_transaction.powersource_temp
-        move_message = string.format('Parking original power-source item in %s...', tostring(ps_temp and ps_temp.label or '<unknown>'))
-        if not ps_temp or not notify_location(ps_temp) then return set_move_error('Could not address the reserved temporary power-source location.') end
-        if not wait_for(function() return cursor_is_empty() and exact_item_match(item_at_location(ps_temp), ps_snap) end) then
-            return set_move_error('Could not verify original power-source item in reserved temporary storage. TAC remains paused.')
+    if not moved then
+        if move_outcome == 'POSTMOVE_TAC_FAILED' then
+            return set_move_error(
+                tostring(move_err) .. ' TAC remains paused; item is still safely verified in power-source.'
+            )
         end
+        return set_move_error(
+            tostring(move_err) .. ' TAC remains paused; inspect cursor, source, and power-source manually.'
+        )
     end
 
-    if not exact_item_match(powersource_item(), selected_snap) then
-        return set_move_error('Final stage verification failed: selected item is not exactly verified in power-source.')
-    end
-    if ps_snap and not exact_item_match(item_at_location(staged_transaction.powersource_temp), ps_snap) then
-        return set_move_error('Final stage verification failed: original power-source item is not exactly verified in reserved temporary storage.')
-    end
-    if item_at_location(source_loc) ~= nil then
-        return set_move_error('Final stage verification failed: selected item source location should be empty.')
-    end
-    if not cursor_is_empty() then return set_move_error('Final stage verification failed: cursor is not empty.') end
+    staged_transaction.tac_resumed_for_monitor = tac_resumed == true
 
     if passive_monitor then
         move_state = 'MONITORING_PROGRESS'
-        if staged_transaction.tac_original_state == 'running' then
-            log(string.format('Passive %s -> %s monitor: resuming TAC after staging. Legendary monitoring will pause TAC immediately when the exact Legendary cursor item is observed.',
-                tostring(staged_transaction.start_tier), tostring(staged_transaction.target_tier)), true)
-            mq.cmd('/ac run')
-            mq.delay(100)
-            local verify = query_tac_state()
-            if verify ~= 'running' then
-                return set_move_error(string.format('Item staged safely, but TAC resume for monitoring failed (status=%s). TAC remains paused; item is still in power-source.', tostring(verify)))
-            end
-            staged_transaction.tac_resumed_for_monitor = true
+        if staged_transaction.tac_resumed_for_monitor then
             move_message = string.format('%s is in power-source. Monitoring next transition=%s, final target=%s; TAC is running.',
                 selected_snap.name, staged_transaction.target_tier, staged_transaction.final_target_tier)
         else
@@ -2965,6 +3848,10 @@ finalize_passive_transition = function(tx)
         -- powersource, so do not move it or interrupt TAC. Update the transaction
         -- identity and continue watching for the Legendary cursor boundary.
         if tx.final_target_tier == 'Legendary' then
+            local xp_entry = tx.queue_entry_id and queue_entry_by_id(tx.queue_entry_id) or nil
+            if xp_entry then
+                xp_mark_tier_complete(xp_entry, 'Base', 'Base -> Enchanted transition verified')
+            end
             tx.start_tier = 'Enchanted'
             tx.target_tier = 'Legendary'
             move_state = 'MONITORING_PROGRESS'
@@ -3293,6 +4180,17 @@ local function process_waiting_safe()
             return set_move_error('WAITING_SAFE validation failed: cursor became occupied before Enchanted restore. TAC remains paused; no item movement was attempted.')
         end
 
+        if queue_auto_recover_safe_interruptions then
+            if not combat_wait.active then
+                schedule_combat_wait(
+                    'ENCHANTED_RESTORE',
+                    tx.queue_entry_id,
+                    'Waiting for 2 seconds continuously clear before Enchanted restore.'
+                )
+            end
+            return
+        end
+
         if in_combat() then return end
 
         log('PHASE3 WAITING_SAFE CLEARED: combat ended; beginning verified Enchanted restore.', true)
@@ -3435,7 +4333,10 @@ local function monitor_passive_item()
             tostring(final_cur and final_cur.id or '<empty>'),
             tostring(final_ps and final_ps.name or '<empty>'),
             tostring(final_ps and final_ps.id or '<empty>')), true)
-        return set_move_error('Power-source emptied while monitoring Legendary, and the exact expected Legendary could not be reconciled on cursor or in inventory.')
+        return set_move_error(
+            'Power-source emptied while monitoring Legendary, and the exact expected Legendary could not be reconciled on cursor or in inventory.',
+            'POSSIBLE_TAC_AUTOINVENTORY'
+        )
     end
 
     local bad_ps = snapshot_item(ps)
@@ -3475,7 +4376,10 @@ local function monitor_passive_item()
         end
     end
 
-    return set_move_error('Power-source contents changed unexpectedly while monitoring Enchanted -> Legendary and could not be reconciled deterministically.')
+    return set_move_error(
+        'Power-source contents changed unexpectedly while monitoring Enchanted -> Legendary and could not be reconciled deterministically.',
+        'POSSIBLE_TAC_AUTOINVENTORY'
+    )
 end
 
 restore_staged_item = function()
@@ -3496,9 +4400,17 @@ restore_staged_item = function()
             log('PHASE3 LEGENDARY RESTORE NOTE: in-combat restore is permitted for this verified Legendary completion transaction because TAC is paused.', true)
         elseif tx.passive_monitor then
             tx.waiting_safe_reason = tx.waiting_safe_reason or 'EnchantedRestore'
-            move_state = 'WAITING_SAFE'
-            move_message = 'Passive target is ready, but character is still in combat. TAC is paused; waiting for combat to end before restore.'
-            log('PHASE3 WAITING_SAFE: ' .. move_message, true)
+            if queue_auto_recover_safe_interruptions and tx.queue_entry_id then
+                schedule_combat_wait(
+                    'ENCHANTED_RESTORE',
+                    tx.queue_entry_id,
+                    'Passive target is ready, but combat blocks restore. Waiting for 2 seconds continuously clear before revalidating restore state.'
+                )
+            else
+                move_state = 'WAITING_SAFE'
+                move_message = 'Passive target is ready, but character is still in combat. TAC is paused; waiting for combat to end before restore.'
+                log('PHASE3 WAITING_SAFE: ' .. move_message, true)
+            end
             return
         else
             return set_move_error('Cannot restore while in combat. TAC remains paused.')
@@ -3705,6 +4617,28 @@ local function process_pending_action()
     end
 end
 
+function draw_auto_recovery_option()
+    local old = queue_auto_recover_safe_interruptions
+    queue_auto_recover_safe_interruptions = ImGui.Checkbox(
+        'Automatically recover safe interruptions',
+        queue_auto_recover_safe_interruptions
+    )
+    if ImGui.IsItemHovered() then
+        ImGui.SetTooltip(
+            'Waits through combat blockers and attempts deterministic recovery from TAC-style item interruptions. '
+            .. 'Exact verified items may be restaged automatically; ambiguous states remain stopped.'
+        )
+    end
+    if old ~= queue_auto_recover_safe_interruptions then
+        save_persistent_state('automatic safe interruption recovery preference changed')
+        log(string.format('AUTO RECOVERY OPTION CHANGED: enabled=%s', tostring(queue_auto_recover_safe_interruptions)), true)
+        if not queue_auto_recover_safe_interruptions then
+            clear_auto_recovery('option disabled by user')
+            clear_combat_wait('option disabled by user')
+        end
+    end
+end
+
 local capture_window_geometry
 
 local function draw_compact_ui()
@@ -3738,6 +4672,7 @@ local function draw_compact_ui()
 
     ImGui.Separator()
     ImGui.Text(string.format('Queue: %s   |   %d active', tostring(queue_state), #queue_entries))
+    draw_xp_eta_summary()
 
     if active_entry or staged_transaction then
         ImGui.Text('Current:')
@@ -3781,6 +4716,7 @@ local function draw_compact_ui()
         local old_keep_tac = queue_keep_tac_running_after_complete
         queue_start_tac_when_started = ImGui.Checkbox('Start TAC when queue starts', queue_start_tac_when_started)
         queue_keep_tac_running_after_complete = ImGui.Checkbox('Keep TAC running after queue finishes', queue_keep_tac_running_after_complete)
+        draw_auto_recovery_option()
         if old_start_tac ~= queue_start_tac_when_started or old_keep_tac ~= queue_keep_tac_running_after_complete then
             save_persistent_state('queue TAC preference changed')
         end
@@ -4009,11 +4945,14 @@ local function draw_ui()
                 ImGui.TextWrapped(queue_message)
             end
 
+            draw_xp_eta_summary()
+
             if queue_idle_editable then
                 local old_start_tac = queue_start_tac_when_started
                 local old_keep_tac = queue_keep_tac_running_after_complete
                 queue_start_tac_when_started = ImGui.Checkbox('Start TAC when queue starts', queue_start_tac_when_started)
                 queue_keep_tac_running_after_complete = ImGui.Checkbox('Keep TAC running after queue finishes', queue_keep_tac_running_after_complete)
+                draw_auto_recovery_option()
                 if old_start_tac ~= queue_start_tac_when_started or old_keep_tac ~= queue_keep_tac_running_after_complete then
                     save_persistent_state('queue TAC preference changed')
                 end
@@ -4225,8 +5164,21 @@ end
 
 mq.bind('/ptie', ptie_command)
 mq.event('PTIE_TAC_STATUS', '#*#[Triune] status: #1#, mode: #*#', tac_status_event)
+mq.event(
+    'PTIE_ITEM_XP',
+    '#*#Your [#1#] absorbs energy, #*# (#2#%)',
+    item_xp_event
+)
 
 log(string.format('%s %s loaded', SCRIPT_NAME, VERSION), true)
+log('v1.3 release: Base and Enchanted XP/hour are tracked independently from direct item-XP chat events. Queue ETA is informational only and never controls queue behavior.', true)
+log('v1.3 ETA policy: unseen queue tiers assume 0% progress; exact active queue item chat percentages replace the assumption. Rates use cumulative observed XP divided by cumulative time between accepted same-item samples for each tier.', true)
+log(string.format('v1.3 XP sample-gap policy: elapsed<=0 samples are deferred into the next positive-elapsed sample; gaps longer than %ss establish a new baseline without diluting the accumulated rate.', tostring(XP_RATE_MAX_SAMPLE_GAP_SECONDS)), true)
+log('v1.3 automatic safe interruption recovery: opt-in and persisted per character/server. Initial allowlist is combat-blocked movement plus POSSIBLE_TAC_AUTOINVENTORY runtime failures.', true)
+log(string.format('v1.3 combat movement gate: observation may finish during combat, but physical movement cannot begin until combat has remained continuously clear for %ss and the operation is revalidated from scratch. Combat beginning after physical movement starts does not abort the in-flight move.', tostring(COMBAT_CLEAR_DEBOUNCE_SECONDS)), true)
+log('v1.3 recovery retry scope: only read-only reconciliation observations are retried. A physical movement verification failure goes directly to ERROR and is never retried by the outer recovery scheduler.', true)
+log('v1.3 movement unification: normal staging and automatic recovery restaging use the same verified pickup/place/original-PS-park/final-verify/TAC-resume primitive. Auto recovery no longer duplicates itemnotify movement logic.', true)
+log('v1.3 UI status fix: successful reconciliation/adoption/restage now replaces stale queue-level wait/resume text with the active monitoring message.', true)
 log('v1.1 includes v1.0.1 fixes: static changelog/build notes are startup-only instead of repeating on refresh; TAC monitoring text now reports queue-started TAC unambiguously; new items may be appended to the future queue while another row is ACTIVE; queue-owned TAC is explicitly restarted and verified after each completed-item handoff before the queue continues; optional keep-TAC-running behavior leaves queue-owned TAC running after successful queue completion.', true)
 log('v1.1 worn-source support: equipped UPGRADABLE items in worn slots 0-20 may be staged/queued; if powersource is occupied, its original item is parked in a separately verified safe inventory slot rather than the worn source slot.', true)
 log('v1.1 queue completion fix: a row is completed only when that row\'s active transaction explicitly verified its requested final tier. Manual restore before target returns the row to QUEUED and pauses the queue, so an already-existing equivalent Legendary cannot false-complete an Enchanted->Legendary row.', true)
@@ -4261,6 +5213,8 @@ mq.imgui.init(SCRIPT_NAME, draw_ui)
 while running do
     if not window_open then running = false break end
     mq.doevents()
+    process_combat_wait()
+    process_auto_recovery()
     process_queue_engine()
     process_pending_action()
     process_waiting_safe()
@@ -4272,4 +5226,5 @@ save_persistent_state('normal Lua shutdown')
 log(string.format('%s %s stopped', SCRIPT_NAME, VERSION), true)
 mq.unbind('/ptie')
 mq.unevent('PTIE_TAC_STATUS')
+mq.unevent('PTIE_ITEM_XP')
 mq.imgui.destroy(SCRIPT_NAME)
